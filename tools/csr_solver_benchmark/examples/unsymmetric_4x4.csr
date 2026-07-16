@@ -1,0 +1,21 @@
+GRIDPACK_CSR_SYSTEM_V1
+name "unsymmetric_4x4"
+contingency "sample"
+newton_iteration 0
+controller_iteration 0
+convergence_status "not_run"
+state "sample with one known right-hand side"
+nrows 4
+ncols 4
+nnz 11
+index_base 0
+rhs_count 1
+row_offsets 5
+0 2 5 8 11
+column_indices 11
+0 1 0 1 2 1 2 3 0 2 3
+values 11
+10 2 3 9 4 1 7 5 2 3 8
+rhs 4
+14 33 43 43
+END_GRIDPACK_CSR_SYSTEM_V1

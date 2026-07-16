@@ -116,6 +116,13 @@ if (GRIDPACK_ENABLE_TESTS)
   enable_testing()
 endif()
 
+option(GRIDPACK_ENABLE_CUDSS
+  "Enable the opt-in NVIDIA cuDSS scalar linear-solver backend" OFF)
+if (GRIDPACK_ENABLE_CUDSS)
+  find_package(CUDAToolkit 13 REQUIRED)
+  find_package(cudss 0.8.0 CONFIG REQUIRED)
+endif()
+
 # -------------------------------------------------------------
 # External project settings, generally
 # -------------------------------------------------------------

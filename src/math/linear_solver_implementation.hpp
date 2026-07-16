@@ -31,6 +31,10 @@
 #ifndef _linear_solver_implementation_hpp_
 #define _linear_solver_implementation_hpp_
 
+#include <cstdint>
+#include <limits>
+#include <string>
+
 #include <boost/scoped_ptr.hpp>
 #include <gridpack/math/linear_solver_interface.hpp>
 #include <gridpack/parallel/distributed.hpp>
@@ -40,6 +44,39 @@
 
 namespace gridpack {
 namespace math {
+
+struct LinearSolverStatistics
+{
+  LinearSolverStatistics(void)
+    : backend("petsc"),
+      cudssCompiled(false),
+      deviceOwner(false),
+      ownerWorldRank(-1),
+      device(-1),
+      analyses(0),
+      factorizations(0),
+      refactorizations(0),
+      solves(0),
+      cacheHits(0),
+      cacheMisses(0),
+      fallbacks(0),
+      lastScaledResidual(std::numeric_limits<double>::quiet_NaN())
+  {}
+
+  std::string backend;
+  bool cudssCompiled;
+  bool deviceOwner;
+  int ownerWorldRank;
+  int device;
+  std::uint64_t analyses;
+  std::uint64_t factorizations;
+  std::uint64_t refactorizations;
+  std::uint64_t solves;
+  std::uint64_t cacheHits;
+  std::uint64_t cacheMisses;
+  std::uint64_t fallbacks;
+  double lastScaledResidual;
+};
 
 // -------------------------------------------------------------
 //  class LinearSolverImplementation
@@ -75,9 +112,14 @@ public:
   }
 
   /// Destructor
-  ~LinearSolverImplementation(void)
+  virtual ~LinearSolverImplementation(void)
   {
     // empty
+  }
+
+  virtual LinearSolverStatistics statistics(void) const
+  {
+    return LinearSolverStatistics();
   }
 
 protected:

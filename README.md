@@ -38,6 +38,8 @@ docker run -it --rm -v $(pwd):/app/workspace pnnl/gridpack:v3.6 bash
 ```
 
 The Docker image supports both AMD64 and ARM64 architectures. See the [Docker usage guide](https://gridpack.readthedocs.io/en/latest/Section2-Docker.html) for more examples.
+For the native Arm64 CUDA 13/cuDSS contingency-analysis image, see the
+[cuDSS container guide](docs/markdown/CUDSS_ARM64_CONTAINER.md).
 
 ### Building from Source
 

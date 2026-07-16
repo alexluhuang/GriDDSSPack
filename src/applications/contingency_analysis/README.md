@@ -37,9 +37,19 @@ When combined, duplicates from the file are automatically skipped.
 |--------|-------------|---------|
 | `groupSize` | Number of MPI processes per contingency (parallelization) | 1 |
 | `printCalcFiles` | Write detailed output for each contingency | true |
+| `writeStats` | Collect and write StatBlock summary files (`vmag.txt`, `pflow.txt`, etc.); `false` skips this work | true |
+| `profile` | Write deterministic per-contingency solve metrics | false |
+| `profileFile` | Profiling CSV path | ca_profile.csv |
 | `minVoltage` | Minimum voltage threshold for violations (p.u.) | 0.9 |
 | `maxVoltage` | Maximum voltage threshold for violations (p.u.) | 1.1 |
 | `qlim` | Enable reactive power limit enforcement (PV to PQ bus conversion) | false |
+
+Profiling can also be enabled without editing the input file by setting
+`GRIDPACK_CA_PROFILE=1`. The CSV includes outcome classification, Newton and
+linear-solve counts, controller passes, and final tolerance for every
+contingency. Its task `-1` row is the world-rank-zero base-case replica; the
+console summary reports the number of base replicas separately and labels
+contingency-only totals explicitly.
 
 ### Contingency File Format
 

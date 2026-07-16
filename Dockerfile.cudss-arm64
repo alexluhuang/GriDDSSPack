@@ -1,0 +1,122 @@
+# syntax=docker/dockerfile:1.7
+
+# These are architecture-specific manifests, not multi-architecture tags.
+# Keeping the digests here makes the dependency stack reproducible and prevents
+# Docker from selecting an amd64 image.
+ARG CUDA_DEVEL_IMAGE=nvcr.io/nvidia/cuda@sha256:38c2598ded0fd3ed2b0b13351543fde493faba43ae580f81f0a9ab58d76fdd2d
+ARG CUDA_RUNTIME_IMAGE=nvcr.io/nvidia/cuda@sha256:532381a7bf759bbe4d9c783468bc2cc4766cf656da5814fb04e049dc58fe268b
+ARG GRIDPACK_BASE_IMAGE=pnnl/gridpack@sha256:83aa02bb755161bc5830783c7847c5e3ce65aa7280c9f141c55f7c632ed7663b
+
+FROM ${CUDA_DEVEL_IMAGE} AS cuda-devel
+FROM ${CUDA_RUNTIME_IMAGE} AS cuda-runtime
+
+FROM ${GRIDPACK_BASE_IMAGE} AS builder
+
+ARG TARGETARCH
+ARG CUDSS_VERSION=0.8.0.10
+ARG CUDSS_ARCHIVE_SHA256=c5fe7e5796792e10c3c5971bbb169ab3040ba61fe6fc99bdcbc02cf0f1ed9409
+ARG CUDSS_ARCHIVE_URL=https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-sbsa/libcudss-linux-sbsa-0.8.0.10_cuda13-archive.tar.xz
+
+RUN test "$(uname -m)" = aarch64 \
+    && test "$(dpkg --print-architecture)" = arm64 \
+    && { test -z "${TARGETARCH}" || test "${TARGETARCH}" = arm64; }
+
+# GridPACK's pinned dependency image is Ubuntu 25.10. NVIDIA publishes the
+# CUDA 13.0 toolkit for Ubuntu 24.04; its self-contained user-space toolkit is
+# copied into the newer-glibc builder and validated by the image smoke tests.
+COPY --from=cuda-devel /usr/local/cuda-13.0 /usr/local/cuda-13.0
+RUN ln -sfn cuda-13.0 /usr/local/cuda \
+    && ln -sfn cuda-13.0 /usr/local/cuda-13 \
+    && readelf --file-header /usr/local/cuda/lib64/libcudart.so.13 \
+       | grep --quiet 'Machine:.*AArch64'
+
+RUN wget --quiet --output-document=/tmp/cudss.tar.xz "${CUDSS_ARCHIVE_URL}" \
+    && echo "${CUDSS_ARCHIVE_SHA256}  /tmp/cudss.tar.xz" | sha256sum --check --strict \
+    && mkdir -p /opt/cudss \
+    && tar --extract --xz --file=/tmp/cudss.tar.xz \
+       --directory=/opt/cudss --strip-components=1 \
+    && rm /tmp/cudss.tar.xz \
+    && test "$(sed -n 's/^set(cudss_VERSION \(.*\))/\1/p' \
+       /opt/cudss/lib/cmake/cudss/cudss-config.cmake)" = "${CUDSS_VERSION%.*}" \
+    && readelf --file-header /opt/cudss/lib/libcudss.so.0.8.0 \
+       | grep --quiet 'Machine:.*AArch64'
+
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDSS_ROOT=/opt/cudss
+
+COPY src /workspace/src
+
+RUN cmake -S /workspace/src -B /workspace/build \
+      -D CMAKE_BUILD_TYPE:STRING=Release \
+      -D CMAKE_BUILD_RPATH:STRING='$ORIGIN/../lib;$ORIGIN' \
+      -D CMAKE_INSTALL_PREFIX:PATH=/opt/gridpack \
+      -D CMAKE_PREFIX_PATH:PATH=/opt/cudss \
+      -D CUDAToolkit_ROOT:PATH=/usr/local/cuda \
+      -D GRIDPACK_ENABLE_CUDSS:BOOL=ON \
+      -D GRIDPACK_ENABLE_TESTS:BOOL=OFF \
+      -D BUILD_SHARED_LIBS:BOOL=ON \
+      -D ENABLE_ENVIRONMENT_FROM_COMM:BOOL=ON \
+      -D GA_DIR:PATH=/deps/ga-5.9.1/install_for_gridpack \
+      -D Boost_ROOT:PATH=/deps/boost-1.81.0/install_for_gridpack \
+      -D Boost_DIR:PATH=/deps/boost-1.81.0/install_for_gridpack/lib/cmake/Boost-1.81.0 \
+      -D PETSC_DIR:PATH=/deps/petsc/install_for_gridpack \
+      -D MPI_C_COMPILER:FILEPATH=/usr/bin/mpicc \
+      -D MPI_CXX_COMPILER:FILEPATH=/usr/bin/mpicxx \
+      -D MPIEXEC_EXECUTABLE:FILEPATH=/usr/bin/mpiexec \
+    && cmake --build /workspace/build --target ca.x --parallel
+
+RUN mkdir -p \
+      /opt/gridpack/bin \
+      /opt/gridpack/lib \
+      /opt/gridpack/share/gridpack/smoke/contingency_analysis \
+    && cp /workspace/build/applications/contingency_analysis/ca.x \
+       /opt/gridpack/bin/ca.x \
+    && find /workspace/build \
+       \( -type f -o -type l \) -name 'libgridpack*.so*' \
+       -exec cp -a -t /opt/gridpack/lib {} + \
+    && cp \
+       /workspace/src/applications/data_sets/input/ca/input_14_auto_n1.xml \
+       /workspace/src/applications/data_sets/raw/IEEE14_ca.raw \
+       /opt/gridpack/share/gridpack/smoke/contingency_analysis/
+
+FROM ${GRIDPACK_BASE_IMAGE} AS runtime
+
+ARG TARGETARCH
+ARG CUDSS_VERSION=0.8.0.10
+
+LABEL org.opencontainers.image.title="GridPACK CA with NVIDIA cuDSS" \
+      org.opencontainers.image.description="Native Arm64 GridPACK contingency analysis with CUDA 13 and cuDSS" \
+      org.opencontainers.image.architecture="arm64" \
+      org.opencontainers.image.cuda.version="13.0.0" \
+      org.opencontainers.image.cudss.version="${CUDSS_VERSION}" \
+      org.opencontainers.image.gridpack.base="pnnl/gridpack@sha256:83aa02bb755161bc5830783c7847c5e3ce65aa7280c9f141c55f7c632ed7663b"
+
+RUN test "$(uname -m)" = aarch64 \
+    && test "$(dpkg --print-architecture)" = arm64 \
+    && { test -z "${TARGETARCH}" || test "${TARGETARCH}" = arm64; } \
+    && mkdir -p /work
+
+COPY --from=cuda-runtime /usr/local/cuda-13.0 /usr/local/cuda-13.0
+COPY --from=cuda-runtime /NGC-DL-CONTAINER-LICENSE \
+     /usr/share/licenses/cuda/NGC-DL-CONTAINER-LICENSE
+RUN ln -sfn cuda-13.0 /usr/local/cuda \
+    && ln -sfn cuda-13.0 /usr/local/cuda-13
+
+COPY --from=builder /opt/cudss /opt/cudss
+COPY --from=builder /opt/gridpack /opt/gridpack
+COPY --chmod=0755 docker/cudss-arm64-entrypoint.sh /usr/local/bin/gridpack-ca
+COPY docker/cudss-arm64-ld.so.conf /etc/ld.so.conf.d/gridpack-cudss.conf
+RUN ldconfig
+
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDSS_ROOT=/opt/cudss \
+    GRIDPACK_DIR=/opt/gridpack \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
+    PATH=/opt/gridpack/bin:/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/gridpack/lib:/opt/cudss/lib:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/deps/boost-1.81.0/install_for_gridpack/lib:/deps/ga-5.9.1/install_for_gridpack/lib:/deps/petsc/install_for_gridpack/lib:/usr/lib/aarch64-linux-gnu/openmpi/lib
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/gridpack-ca"]
+CMD ["input.xml"]

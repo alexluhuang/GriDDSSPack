@@ -50,6 +50,7 @@
 #include "gridpack/export/PSSE23Export.hpp"
 #include "gridpack/parser/GOSS_parser.hpp"
 #include "gridpack/math/math.hpp"
+#include "gridpack/math/petsc/petsc_csr_exporter.hpp"
 #include "pf_helper.hpp"
 #include "gridpack/utilities/string_utils.hpp"
 #include <algorithm>
@@ -63,6 +64,7 @@
 gridpack::powerflow::PFAppModule::PFAppModule(void)
 {
   p_no_print = false;
+  p_solveMetrics = PFSolveMetrics();
 }
 
 /**
@@ -418,10 +420,13 @@ void gridpack::powerflow::PFAppModule::reload()
  */
 bool gridpack::powerflow::PFAppModule::solve()
 {
+  p_solveMetrics = PFSolveMetrics();
   bool ret = true;
   gridpack::utility::CoarseTimer *timer =
     gridpack::utility::CoarseTimer::instance();
   int t_total = timer->createCategory("Powerflow: Total Application");
+  int t_controller =
+    timer->createCategory("Powerflow: Controller Checks");
   timer->start(t_total);
   p_factory->clearViolations();
   char ioBuf[128];
@@ -465,6 +470,7 @@ bool gridpack::powerflow::PFAppModule::solve()
   while (ai_repeat) {
     ai_repeat = false;
     ai_iter++;
+    p_solveMetrics.areaInterchangePasses++;
 
   // =========================================================================
   // Controller Loop — handles qlim, switched shunts, IREG, LTC
@@ -476,6 +482,7 @@ bool gridpack::powerflow::PFAppModule::solve()
     ret = true;  // Reset ret - if this iteration converges, we should return true
     ctrl_repeat = false;
     ctrl_iter++;
+    p_solveMetrics.controllerLoopPasses++;
     bool qlim_handled_early = false;  // Track if Q limits were handled during stagnation
 
     if (!p_no_print) {
@@ -529,6 +536,11 @@ bool gridpack::powerflow::PFAppModule::solve()
     p_convergence.perIteration.clear();
     p_convergence.converged = false;
     p_convergence.iterations = 0;
+    p_convergence.finalTolerance = real(tol_org);
+    p_convergence.finalMismatch.maxPBus = 0;
+    p_convergence.finalMismatch.maxPMismatch = 0.0;
+    p_convergence.finalMismatch.maxQBus = 0;
+    p_convergence.finalMismatch.maxQMismatch = 0.0;
 
     timer->start(t_cmap);
     p_factory->setMode(Jacobian);
@@ -560,14 +572,45 @@ bool gridpack::powerflow::PFAppModule::solve()
 #else
     gridpack::math::LinearSolver solver(*J);
 #endif
-    solver.configure(cursor);
+    try {
+      solver.configure(cursor);
+    } catch (...) {
+      timer->stop(t_csolv);
+      timer->stop(t_total);
+      throw;
+    }
     timer->stop(t_csolv);
+
+#ifdef USE_REAL_VALUES
+    gridpack::math::PetscCsrExportContext csrContext;
+    csrContext.baseCase = p_contingency_name.empty();
+    csrContext.caseName = csrContext.baseCase
+      ? "base_case" : p_contingency_name;
+    csrContext.areaInterchangePass = ai_iter;
+    csrContext.controllerPass = ctrl_iter;
+    csrContext.qlimEnabled = p_qlim;
+    csrContext.switchedShuntEnabled = p_switchedShunt;
+    csrContext.ltcEnabled = p_ltc;
+    csrContext.areaInterchangeEnabled = p_areaInterchange;
+#endif
 
     // First NR iteration
     X->zero();
     int t_lsolv = timer->createCategory("Powerflow: Solve Linear Equation");
+#ifdef USE_REAL_VALUES
+    csrContext.newtonIteration = 1;
+    csrContext.linearSolveOrdinal = p_solveMetrics.linearSolveCalls + 1;
+    try {
+      gridpack::math::exportPetscRealCsrSystemIfEnabled(
+          *J, *PQ, csrContext);
+    } catch (...) {
+      timer->stop(t_total);
+      throw;
+    }
+#endif
     timer->start(t_lsolv);
     try {
+      p_solveMetrics.linearSolveCalls++;
       solver.solve(*PQ, *X);
     } catch (const gridpack::Exception e) {
       std::string w(e.what());
@@ -611,6 +654,7 @@ bool gridpack::powerflow::PFAppModule::solve()
       timer->start(t_updt);
       p_network->updateBuses();
       timer->stop(t_updt);
+      p_solveMetrics.completedNewtonUpdates++;
 
       // Create new versions of Jacobian and PQ vector
       timer->start(t_vmap);
@@ -630,9 +674,21 @@ bool gridpack::powerflow::PFAppModule::solve()
       timer->stop(t_mmap);
 
       // Solve linear system
-      timer->start(t_lsolv);
       X->zero();
+#ifdef USE_REAL_VALUES
+      csrContext.newtonIteration = iter + 2;
+      csrContext.linearSolveOrdinal = p_solveMetrics.linearSolveCalls + 1;
       try {
+        gridpack::math::exportPetscRealCsrSystemIfEnabled(
+            *J, *PQ, csrContext);
+      } catch (...) {
+        timer->stop(t_total);
+        throw;
+      }
+#endif
+      timer->start(t_lsolv);
+      try {
+        p_solveMetrics.linearSolveCalls++;
         solver.solve(*PQ, *X);
       } catch (const gridpack::Exception e) {
         std::string w(e.what());
@@ -784,6 +840,7 @@ bool gridpack::powerflow::PFAppModule::solve()
     // Controller checks (after NR converges or exits)
     // =====================================================================
 
+    timer->start(t_controller);
     // Skip controller adjustments if inner NR failed — voltages are invalid
     // and adjustments based on bad voltages will make the next solve worse.
     if (!ret) {
@@ -858,6 +915,7 @@ bool gridpack::powerflow::PFAppModule::solve()
       }
       ctrl_repeat = false;
     }
+    timer->stop(t_controller);
 
     // Push final result back onto buses, but ONLY if no controller changes.
     // If qlim changed PV->PQ, vMap dimensions are stale — a new iteration
@@ -872,6 +930,7 @@ bool gridpack::powerflow::PFAppModule::solve()
       timer->start(t_updt);
       p_network->updateBuses();
       timer->stop(t_updt);
+      p_solveMetrics.completedNewtonUpdates++;
     }
   }  // end controller loop
 
@@ -1030,6 +1089,15 @@ gridpack::utility::ConvergenceSummary
 gridpack::powerflow::PFAppModule::getConvergence() const
 {
   return p_convergence;
+}
+
+/**
+ * Get execution counts from the most recent hand-coded solve
+ */
+gridpack::powerflow::PFSolveMetrics
+gridpack::powerflow::PFAppModule::getSolveMetrics() const
+{
+  return p_solveMetrics;
 }
 
 /**
@@ -1462,11 +1530,6 @@ bool gridpack::powerflow::PFAppModule::setContingency(
   } else {
     ret = false;
   }
-  if (ret) {
-    p_contingency_name = event.p_name;
-  } else {
-    p_contingency_name.clear();
-  }
   p_factory->checkLoneBus();
   // Check if slack bus still has online generator, transfer if needed
   bool slackOk = p_factory->checkAndTransferSlack();
@@ -1475,6 +1538,11 @@ bool gridpack::powerflow::PFAppModule::setContingency(
     ret = false;
   }
   p_factory->detectIslands();  // Detect islands after applying contingency
+  if (ret) {
+    p_contingency_name = event.p_name;
+  } else {
+    p_contingency_name.clear();
+  }
   return ret;
 }
 
@@ -1573,6 +1641,7 @@ bool gridpack::powerflow::PFAppModule::unSetContingency(
   } else {
     ret = false;
   }
+  p_contingency_name.clear();
   return ret;
 }
 

@@ -18,6 +18,39 @@
         -ksp_view
       </PETScOptions>
     </LinearSolver>
+
+    <CUDSSDeviceValidation>
+      <LinearSolver>
+        <Backend>cudss</Backend>
+        <CUDSSMode>device</CUDSSMode>
+        <CUDSSStrict>false</CUDSSStrict>
+        <CUDSSResidualTolerance>1.0E-10</CUDSSResidualTolerance>
+        <SolutionTolerance>1.0E-12</SolutionTolerance>
+        <RelativeTolerance>1.0E-12</RelativeTolerance>
+        <MaxIterations>100</MaxIterations>
+      </LinearSolver>
+    </CUDSSDeviceValidation>
+
+    <CUDSSHybridValidation>
+      <LinearSolver>
+        <Backend>cudss</Backend>
+        <CUDSSMode>hybrid</CUDSSMode>
+        <CUDSSStrict>false</CUDSSStrict>
+        <CUDSSResidualTolerance>1.0E-10</CUDSSResidualTolerance>
+        <SolutionTolerance>1.0E-12</SolutionTolerance>
+        <RelativeTolerance>1.0E-12</RelativeTolerance>
+        <MaxIterations>100</MaxIterations>
+      </LinearSolver>
+    </CUDSSHybridValidation>
+
+    <CUDSSStrictValidation>
+      <LinearSolver>
+        <Backend>cudss</Backend>
+        <CUDSSMode>device</CUDSSMode>
+        <CUDSSStrict>true</CUDSSStrict>
+        <CUDSSResidualTolerance>1.0E-300</CUDSSResidualTolerance>
+      </LinearSolver>
+    </CUDSSStrictValidation>
          
     <!-- Uncomment this to check that ForceSerial works (the petsc lu
          preconditioner is serial only

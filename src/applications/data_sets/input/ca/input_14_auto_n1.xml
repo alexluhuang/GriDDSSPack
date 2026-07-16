@@ -3,6 +3,8 @@
   <Contingency_analysis>
     <!-- Test auto N-1 generation feature -->
     <printCalcFiles>false</printCalcFiles>
+    <writeStats>false</writeStats>
+    <profile>true</profile>
     <FullBranchN1>true</FullBranchN1>
     <FullGeneratorN1>true</FullGeneratorN1>
     <groupSize>1</groupSize>

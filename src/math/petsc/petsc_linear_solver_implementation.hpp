@@ -50,6 +50,7 @@ public:
   PETScLinearSolverImplementation(MatrixType& A)
     : LinearSolverImplementation<T, I>(A),
       PETScConfigurable(this->communicator()),
+      p_KSP(NULL),
       p_matrixSet(false)
   {
     p_no_print = gridpack::NoPrint::instance()->status();
@@ -62,7 +63,7 @@ public:
     try  {
       PetscBool ok;
       ierr = PetscInitialized(&ok);
-      if (ok) {
+      if (ok && p_KSP != NULL) {
         ierr = KSPDestroy(&p_KSP); CHKERRXX(ierr);
       }
     } catch (...) {

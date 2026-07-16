@@ -102,7 +102,16 @@ public:
   ~LinearSolverT(void)
   {}
 
+  LinearSolverStatistics statistics(void) const
+  {
+    return p_solver->statistics();
+  }
+
 protected:
+
+  void p_preconfigure(utility::Configuration::CursorPtr props);
+
+  MatrixType& p_matrix;
 
   /// Where the work really happens
   /**

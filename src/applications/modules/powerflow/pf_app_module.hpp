@@ -85,6 +85,21 @@ struct Contingency
   std::vector<bool> p_saveGenStatus;
 };
 
+/**
+ * Execution counts from the most recent hand-coded power flow solve.
+ */
+struct PFSolveMetrics
+{
+  // Attempted linear solves, including calls that throw an exception
+  int linearSolveCalls;
+  // Newton corrections mapped to buses and followed by a ghost-bus update
+  int completedNewtonUpdates;
+  // Controller-loop passes entered
+  int controllerLoopPasses;
+  // Area-interchange-loop passes entered
+  int areaInterchangePasses;
+};
+
 // Calling program for powerflow application
 
 class PFAppModule
@@ -156,6 +171,11 @@ class PFAppModule
      * Get convergence summary from last solve
      */
     gridpack::utility::ConvergenceSummary getConvergence() const;
+
+    /**
+     * Get execution counts from the most recent call to solve
+     */
+    PFSolveMetrics getSolveMetrics() const;
 
     /**
      * Collect power flow results into structured format for export
@@ -1001,6 +1021,9 @@ class PFAppModule
 
     // Convergence tracking for mismatch reporting and export
     gridpack::utility::ConvergenceSummary p_convergence;
+
+    // Execution counts from the most recent hand-coded solve
+    PFSolveMetrics p_solveMetrics;
 
 #ifdef USE_GOSS
     gridpack::goss::GOSSClient p_goss_client;

@@ -83,6 +83,8 @@ if (PETSC_FOUND)
     petsc/petsc_matrix.cpp
     petsc/petsc_matrix_operations.cpp
     petsc/petsc_matrix_wrapper.cpp
+    petsc/petsc_csr_exporter.cpp
+    cudss/cudss_linear_solver.cpp
     petsc/petsc_matrix.cpp
     petsc/petsc_linear_solver.cpp
     petsc/petsc_linear_matrix_solver.cpp
@@ -141,6 +143,29 @@ add_library(gridpack_math
 
 gridpack_set_library_version(gridpack_math)
 add_dependencies(gridpack_math external_build)
+
+if (GRIDPACK_ENABLE_CUDSS)
+  target_compile_definitions(gridpack_math PRIVATE GRIDPACK_HAVE_CUDSS=1)
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(gridpack_math
+      PUBLIC
+        cudss
+        -Wl,--no-as-needed
+        CUDA::cublas
+        -Wl,--as-needed
+        CUDA::cusolver
+        CUDA::cudart
+    )
+  else()
+    target_link_libraries(gridpack_math
+      PUBLIC
+        cudss
+        CUDA::cublas
+        CUDA::cusolver
+        CUDA::cudart
+    )
+  endif()
+endif()
 
 if (NOT USE_OLD_PETSC)
   target_link_libraries(gridpack_math 
@@ -246,6 +271,14 @@ set_target_properties(real_sparse_matrix_test
 target_link_libraries(real_sparse_matrix_test gridpack_math ${target_libraries})
 gridpack_add_unit_test(real_sparse_matrix real_sparse_matrix_test)
 
+add_executable(petsc_csr_exporter_test
+  test/petsc_csr_exporter_test.cpp)
+target_link_libraries(petsc_csr_exporter_test
+  gridpack_math ${target_libraries})
+gridpack_add_serial_unit_test(petsc_csr_exporter
+  petsc_csr_exporter_test)
+add_dependencies(petsc_csr_exporter_test math_test_input)
+
 add_executable(complex_dense_matrix_test test/matrix_test.cpp)
 set_target_properties(complex_dense_matrix_test
   PROPERTIES
@@ -312,6 +345,16 @@ if (PETSC_FOUND)
   add_dependencies(complex_linear_solver_test math_test_input)
 endif()
 
+add_executable(cudss_linear_solver_test
+  test/cudss_linear_solver_test.cpp)
+target_link_libraries(cudss_linear_solver_test
+  gridpack_math ${target_libraries})
+gridpack_add_serial_unit_test(cudss_linear_solver
+  cudss_linear_solver_test)
+if (PETSC_FOUND)
+  add_dependencies(cudss_linear_solver_test math_test_input)
+endif()
+
 # -------------------------------------------------------------
 # nonlinear solver test suite
 # -------------------------------------------------------------
@@ -372,4 +415,3 @@ install(TARGETS
   gridpack_math
   DESTINATION lib
   )
-

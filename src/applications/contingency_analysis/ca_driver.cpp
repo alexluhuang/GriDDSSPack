@@ -29,12 +29,83 @@
 #include "gridpack/utilities/results_exporter.hpp"
 #include "ca_driver.hpp"
 
+#include <boost/scoped_ptr.hpp>
+#include <cstdlib>
+#include <limits>
 #include <sstream>
 
 #define USE_SUCCESS
-#define USE_STATBLOCK
 // Sets up multiple communicators so that individual contingency calculations
 // can be run concurrently
+
+namespace {
+
+enum CAProfileStatus
+{
+  PROFILE_CONVERGED = 1,
+  PROFILE_DIVERGENT = 2,
+  PROFILE_ISLANDED = 3,
+  PROFILE_REJECTED = 4,
+  PROFILE_SLACK_OVERLOAD = 5
+};
+
+struct CAProfileRecord
+{
+  int status;
+  int powerFlowSolveCalls;
+  int linearSolveCalls;
+  int completedNewtonUpdates;
+  int reportedNewtonIterations;
+  int controllerLoopPasses;
+  int areaInterchangePasses;
+  double finalTolerance;
+};
+
+void accumulateSolveMetrics(
+    CAProfileRecord& record,
+    const gridpack::powerflow::PFSolveMetrics& metrics,
+    const gridpack::utility::ConvergenceSummary& convergence)
+{
+  record.powerFlowSolveCalls++;
+  record.linearSolveCalls += metrics.linearSolveCalls;
+  record.completedNewtonUpdates += metrics.completedNewtonUpdates;
+  record.reportedNewtonIterations += convergence.iterations;
+  record.controllerLoopPasses += metrics.controllerLoopPasses;
+  record.areaInterchangePasses += metrics.areaInterchangePasses;
+  record.finalTolerance = convergence.finalTolerance;
+}
+
+const char *profileStatusName(int status)
+{
+  switch (status) {
+    case PROFILE_CONVERGED:
+      return "converged";
+    case PROFILE_DIVERGENT:
+      return "divergent";
+    case PROFILE_ISLANDED:
+      return "islanded";
+    case PROFILE_REJECTED:
+      return "rejected";
+    case PROFILE_SLACK_OVERLOAD:
+      return "slack_overload";
+    default:
+      return "unknown";
+  }
+}
+
+std::string csvField(const std::string& value)
+{
+  std::string result("\"");
+  for (std::string::const_iterator iter = value.begin();
+       iter != value.end(); ++iter) {
+    if (*iter == '"') result += '"';
+    result += *iter;
+  }
+  result += '"';
+  return result;
+}
+
+} // anonymous namespace
 
 /**
  * Basic constructor
@@ -366,6 +437,17 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       print_calcs = true;
     }
   }
+  bool write_stats = cursor->get("writeStats", true);
+  bool profile = cursor->get("profile", false);
+  const char *profile_env = std::getenv("GRIDPACK_CA_PROFILE");
+  if (profile_env != NULL) {
+    std::string profile_value(profile_env);
+    util.toLower(profile_value);
+    profile = profile_value != "0" && profile_value != "false" &&
+      profile_value != "off";
+  }
+  std::string profile_file = "ca_profile.csv";
+  cursor->get("profileFile", &profile_file);
   if (!cursor->get("groupSize",&grp_size)) {
     grp_size = 1;
   }
@@ -399,6 +481,12 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   std::vector<bool> contingency_isolated;
   gridpack::parallel::GlobalVector<bool> ca_isolated(world);
 #endif
+  boost::scoped_ptr<gridpack::parallel::GlobalVector<CAProfileRecord> >
+    ca_profile;
+  if (profile) {
+    ca_profile.reset(
+        new gridpack::parallel::GlobalVector<CAProfileRecord>(world));
+  }
 
   // Create powerflow applications on each task communicator
   boost::shared_ptr<gridpack::powerflow::PFNetwork>
@@ -414,11 +502,24 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   pf_app.setVoltageLimits(Vmin, Vmax);
   // Solve the base power flow calculation. This calculation is replicated on
   // all task communicators
-  pf_app.solve();
+  int t_base = timer->createCategory("Contingency: Base Case");
+  timer->start(t_base);
+  bool base_solve_ok = pf_app.solve();
+  CAProfileRecord base_profile = {};
+  base_profile.finalTolerance = std::numeric_limits<double>::quiet_NaN();
+  if (profile) {
+    accumulateSolveMetrics(base_profile, pf_app.getSolveMetrics(),
+        pf_app.getConvergence());
+  }
   // Check for Qlimit violations
   if (check_Qlim && !pf_app.checkQlimViolations()) {
-    pf_app.solve();
+    base_solve_ok = pf_app.solve();
+    if (profile) {
+      accumulateSolveMetrics(base_profile, pf_app.getSolveMetrics(),
+          pf_app.getConvergence());
+    }
   }
+  timer->stop(t_base);
   // Some buses may violate the voltage limits in the base problem. Flag these
   // buses to ignore voltage violations on them.
   pf_app.ignoreVoltageViolations();
@@ -579,177 +680,170 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   int nbus = pf_network->totalBuses();
   // Get bus voltage information for base case
   int i, j;
-#ifdef USE_STATBLOCK
+  boost::scoped_ptr<gridpack::analysis::StatBlock> vmag_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> vang_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> pgen_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> qgen_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> pflow_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> qflow_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> perf_stats;
+  std::vector<std::string> v_vals;
+  int nsize = 0;
+  std::vector<double> vmag, vang, pgen, qgen, pflow, qflow, perf;
+  std::vector<int> mask, mag_mask;
   int t_store = timer->createCategory("Store Statistics");
-  timer->start(t_store);
-  std::vector<std::string> v_vals = pf_app.writeBusString("vr_str");
-  int nsize = v_vals.size();
-  std::vector<int> mag_ids;
-  std::vector<int> ids;
-  std::vector<int> branch_ids;
-  std::vector<std::string> mag_tags;
-  std::vector<std::string> tags;
-  std::vector<double> vmag;
-  std::vector<double> vang;
-  std::vector<int> mag_mask;
-  std::vector<int> mask;
-  // Find bus IDs and create a dummy tag label and get voltage magnitude
-  // and angle for base case
-  for (i=0; i<nsize; i++) {
-    std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-    int not_isolated = atoi(tokens[3].c_str());
-    if (not_isolated == 1) {
-      mag_ids.push_back(atoi(tokens[0].c_str()));
-      mag_tags.push_back("1 ");
-      vmag.push_back(atof(tokens[2].c_str()));
-      if (atoi(tokens[4].c_str()) != 0) {
-        mag_mask.push_back(2);
-      } else {
-        mag_mask.push_back(1);
+  if (write_stats) {
+    timer->start(t_store);
+    v_vals = pf_app.writeBusString("vr_str");
+    nsize = v_vals.size();
+    std::vector<int> mag_ids;
+    std::vector<int> ids;
+    std::vector<std::string> mag_tags;
+    std::vector<std::string> tags;
+    // Find bus IDs and create a dummy tag label and get voltage magnitude
+    // and angle for base case
+    for (i=0; i<nsize; i++) {
+      std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+      int not_isolated = atoi(tokens[3].c_str());
+      if (not_isolated == 1) {
+        mag_ids.push_back(atoi(tokens[0].c_str()));
+        mag_tags.push_back("1 ");
+        vmag.push_back(atof(tokens[2].c_str()));
+        if (atoi(tokens[4].c_str()) != 0) {
+          mag_mask.push_back(2);
+        } else {
+          mag_mask.push_back(1);
+        }
       }
-    }
-    ids.push_back(atoi(tokens[0].c_str()));
-    tags.push_back("1 ");
-    vang.push_back(atof(tokens[1].c_str()));
-    mask.push_back(1);
-  }
-  int nmags = vmag.size();
-  world.max(&nmags,1);
-  world.max(&nbus,1);
-#endif
-  // Create StatBlock objects for voltage magnitude and angles and add
-  // bus IDs to it
-#ifdef USE_STATBLOCK
-  gridpack::analysis::StatBlock vmag_stats(world,nmags,ntasks+1);
-  gridpack::analysis::StatBlock vang_stats(world,nbus,ntasks+1);
-#endif
-  // Add bus IDs and tags to StatBlock objects as well as base case values of
-  // voltage magnitude and angle
-#ifdef USE_STATBLOCK
-  if (world.rank() == 0) {
-    vmag_stats.addRowLabels(mag_ids, mag_tags);
-    vang_stats.addRowLabels(ids, tags);
-    vmag_stats.addColumnValues(0,vmag,mag_mask);
-    vang_stats.addColumnValues(0,vang,mask);
-  }
-#endif
-  // Get generator power information
-#ifdef USE_STATBLOCK
-  v_vals.clear();
-  ids.clear();
-  tags.clear();
-  mask.clear();
-  std::vector<double> pgen;
-  std::vector<double> qgen;
-  v_vals = pf_app.writeBusString("power");
-  nsize = v_vals.size();
-  // Find bus IDs and tags for generators and eveluate Pg and Qg for base case
-  for (i=0; i<nsize; i++) {
-    std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-    if (tokens.size()%4 != 0) {
-      printf("Incorrect generator listing\n");
-      continue;
-    }
-    int ngen = tokens.size()/4;
-    for (j=0; j<ngen; j++) {
-      ids.push_back(atoi(tokens[j*4].c_str()));
-      tags.push_back(tokens[j*4+1]);
-      pgen.push_back(atof(tokens[j*4+2].c_str()));
-      qgen.push_back(atof(tokens[j*4+3].c_str()));
+      ids.push_back(atoi(tokens[0].c_str()));
+      tags.push_back("1 ");
+      vang.push_back(atof(tokens[1].c_str()));
       mask.push_back(1);
     }
-  }
-  nsize = pgen.size();
-  world.max(&nsize,1);
-#endif
-  // Create StatBlock objects for Pg and Qg and add labels as well as values for
-  // base case
-#ifdef USE_STATBLOCK
-  gridpack::analysis::StatBlock pgen_stats(world,nsize,ntasks+1);
-  gridpack::analysis::StatBlock qgen_stats(world,nsize,ntasks+1);
-  if (world.rank() == 0) {
-    pgen_stats.addRowLabels(ids, tags);
-    qgen_stats.addRowLabels(ids, tags);
-    pgen_stats.addColumnValues(0,pgen,mask);
-    qgen_stats.addColumnValues(0,qgen,mask);
-  }
-#endif
-
-  // Find flow parameters for all branch lines
-#ifdef USE_STATBLOCK
-  v_vals.clear();
-  ids.clear();
-  tags.clear();
-  mask.clear();
-  std::vector<int> id1;
-  std::vector<int> id2;
-  std::vector<double> pmin, pmax;
-  std::vector<double> pflow;
-  std::vector<double> qflow;
-  std::vector<double> perf;
-  v_vals = pf_app.writeBranchString("flow_str");
-  nsize = v_vals.size();
-  // Parse branch line endpoints as well as line IDs and values of P and Q for
-  // base case
-  for (i=0; i<nsize; i++) {
-    std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-    if (tokens.size()%8 != 0) {
-      printf("Incorrect branch power flow listing\n");
-      continue;
+    int nmags = vmag.size();
+    world.max(&nmags,1);
+    world.max(&nbus,1);
+    // Create StatBlock objects for voltage magnitude and angles and add
+    // bus IDs to it as well as base case values
+    vmag_stats.reset(new gridpack::analysis::StatBlock(world,nmags,ntasks+1));
+    vang_stats.reset(new gridpack::analysis::StatBlock(world,nbus,ntasks+1));
+    if (world.rank() == 0) {
+      vmag_stats->addRowLabels(mag_ids, mag_tags);
+      vang_stats->addRowLabels(ids, tags);
+      vmag_stats->addColumnValues(0,vmag,mag_mask);
+      vang_stats->addColumnValues(0,vang,mask);
     }
-    int nline = tokens.size()/8;
-    for (j=0; j<nline; j++) {
-      id1.push_back(atoi(tokens[j*8].c_str()));
-      id2.push_back(atoi(tokens[j*8+1].c_str()));
-      tags.push_back(tokens[j*8+2]);
-      pflow.push_back(atof(tokens[j*8+3].c_str()));
-      qflow.push_back(atof(tokens[j*8+4].c_str()));
-      perf.push_back(atof(tokens[j*8+5].c_str()));
-      pmin.push_back(-atof(tokens[j*8+6].c_str()));
-      pmax.push_back(atof(tokens[j*8+6].c_str()));
-      if (atoi(tokens[j*8+7].c_str()) == 0) {
+    // Get generator power information
+    v_vals.clear();
+    ids.clear();
+    tags.clear();
+    mask.clear();
+    v_vals = pf_app.writeBusString("power");
+    nsize = v_vals.size();
+    // Find bus IDs and tags for generators and evaluate Pg and Qg for base case
+    for (i=0; i<nsize; i++) {
+      std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+      if (tokens.size()%4 != 0) {
+        printf("Incorrect generator listing\n");
+        continue;
+      }
+      int ngen = tokens.size()/4;
+      for (j=0; j<ngen; j++) {
+        ids.push_back(atoi(tokens[j*4].c_str()));
+        tags.push_back(tokens[j*4+1]);
+        pgen.push_back(atof(tokens[j*4+2].c_str()));
+        qgen.push_back(atof(tokens[j*4+3].c_str()));
         mask.push_back(1);
-      } else {
-        mask.push_back(2);
       }
     }
+    nsize = pgen.size();
+    world.max(&nsize,1);
+    // Create StatBlock objects for Pg and Qg and add labels and base case values
+    pgen_stats.reset(new gridpack::analysis::StatBlock(world,nsize,ntasks+1));
+    qgen_stats.reset(new gridpack::analysis::StatBlock(world,nsize,ntasks+1));
+    if (world.rank() == 0) {
+      pgen_stats->addRowLabels(ids, tags);
+      qgen_stats->addRowLabels(ids, tags);
+      pgen_stats->addColumnValues(0,pgen,mask);
+      qgen_stats->addColumnValues(0,qgen,mask);
+    }
+
+    // Find flow parameters for all branch lines
+    v_vals.clear();
+    ids.clear();
+    tags.clear();
+    mask.clear();
+    std::vector<int> id1;
+    std::vector<int> id2;
+    std::vector<double> pmin, pmax;
+    v_vals = pf_app.writeBranchString("flow_str");
+    nsize = v_vals.size();
+    // Parse branch line endpoints as well as line IDs and values of P and Q for
+    // base case
+    for (i=0; i<nsize; i++) {
+      std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+      if (tokens.size()%8 != 0) {
+        printf("Incorrect branch power flow listing\n");
+        continue;
+      }
+      int nline = tokens.size()/8;
+      for (j=0; j<nline; j++) {
+        id1.push_back(atoi(tokens[j*8].c_str()));
+        id2.push_back(atoi(tokens[j*8+1].c_str()));
+        tags.push_back(tokens[j*8+2]);
+        pflow.push_back(atof(tokens[j*8+3].c_str()));
+        qflow.push_back(atof(tokens[j*8+4].c_str()));
+        perf.push_back(atof(tokens[j*8+5].c_str()));
+        pmin.push_back(-atof(tokens[j*8+6].c_str()));
+        pmax.push_back(atof(tokens[j*8+6].c_str()));
+        if (atoi(tokens[j*8+7].c_str()) == 0) {
+          mask.push_back(1);
+        } else {
+          mask.push_back(2);
+        }
+      }
+    }
+    nsize = pflow.size();
+    world.max(&nsize,1);
+    // Create StatBlock objects for flow parameters and add labels and base case
+    // values
+    pflow_stats.reset(new gridpack::analysis::StatBlock(world,nsize,ntasks+1));
+    qflow_stats.reset(new gridpack::analysis::StatBlock(world,nsize,ntasks+1));
+    perf_stats.reset(new gridpack::analysis::StatBlock(world,nsize,ntasks+1));
+    if (world.rank() == 0) {
+      pflow_stats->addRowLabels(id1, id2, tags);
+      qflow_stats->addRowLabels(id1, id2, tags);
+      perf_stats->addRowLabels(id1, id2, tags);
+      pflow_stats->addColumnValues(0,pflow,mask);
+      qflow_stats->addColumnValues(0,qflow,mask);
+      perf_stats->addColumnValues(0,perf,mask);
+      pflow_stats->addRowMinValue(pmin);
+      qflow_stats->addRowMinValue(pmin);
+      pflow_stats->addRowMaxValue(pmax);
+      qflow_stats->addRowMaxValue(pmax);
+    }
+    timer->stop(t_store);
   }
-  nsize = pflow.size();
-  world.max(&nsize,1);
-#endif
-  // Create StatBlock objects for flow parameters and add labels and base case
-  // values
-#ifdef USE_STATBLOCK
-  gridpack::analysis::StatBlock pflow_stats(world,nsize,ntasks+1);
-  gridpack::analysis::StatBlock qflow_stats(world,nsize,ntasks+1);
-  gridpack::analysis::StatBlock perf_stats(world,nsize,ntasks+1);
-  if (world.rank() == 0) {
-    pflow_stats.addRowLabels(id1, id2, tags);
-    qflow_stats.addRowLabels(id1, id2, tags);
-    perf_stats.addRowLabels(id1, id2, tags);
-    pflow_stats.addColumnValues(0,pflow,mask);
-    qflow_stats.addColumnValues(0,qflow,mask);
-    perf_stats.addColumnValues(0,perf,mask);
-    pflow_stats.addRowMinValue(pmin);
-    qflow_stats.addRowMinValue(pmin);
-    pflow_stats.addRowMaxValue(pmax);
-    qflow_stats.addRowMaxValue(pmax);
-  }
-  timer->stop(t_store);
-#endif
   if (check_Qlim) pf_app.clearQlimViolations();
   // Clear any Q limit warnings from base case before starting contingencies
   gridpack::powerflow::PFBus::clearQlimWarnings();
 
   // Local contingency results storage for JSON/CSV export
   std::vector<gridpack::utility::ContingencyResult> localContingencies;
+  std::vector<int> local_profile_indices;
+  std::vector<CAProfileRecord> local_profile_records;
 
   // Evaluate contingencies using the task manager
   int task_id;
   char sbuf[128];
+  int t_tasks = timer->createCategory("Contingency: Execute Tasks");
+  timer->start(t_tasks);
   // nextTask returns the same task_id on all processors in task_comm. When the
   // calculation runs out of task, nextTask will return false.
   while (taskmgr.nextTask(task_comm, &task_id)) {
+    CAProfileRecord profile_record = {};
+    profile_record.finalTolerance =
+      std::numeric_limits<double>::quiet_NaN();
     printf("Executing task %d on process %d\n",task_id,world.rank());
     // Trim trailing spaces from contingency name for filename
     std::string fname = events[task_id].p_name;
@@ -813,8 +907,16 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     if (contingencyFound && !islandDetected) {
       try {
         solveOk = pf_app.solve();
+        if (profile) {
+          accumulateSolveMetrics(profile_record, pf_app.getSolveMetrics(),
+              pf_app.getConvergence());
+        }
         if (solveOk && check_Qlim && !pf_app.checkQlimViolations()) {
-          pf_app.solve();
+          solveOk = pf_app.solve();
+          if (profile) {
+            accumulateSolveMetrics(profile_record, pf_app.getSolveMetrics(),
+                pf_app.getConvergence());
+          }
         }
       } catch (const std::exception& e) {
         printf("p[%d] hit exception: %s\n", world.rank(), e.what());
@@ -823,6 +925,15 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       } catch (...) {
         printf("p[%d] hit unknown exception during solve\n", world.rank());
         solveOk = false;
+      }
+    }
+    if (profile) {
+      if (!contingencyFound) {
+        profile_record.status = PROFILE_REJECTED;
+      } else if (islandDetected) {
+        profile_record.status = PROFILE_ISLANDED;
+      } else if (!solveOk) {
+        profile_record.status = PROFILE_DIVERGENT;
       }
     }
     if (solveOk) {
@@ -836,6 +947,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       // Check if slack bus generator exceeds capacity
       slackCapacityOk = pf_app.checkSlackCapacity();
       if (!slackCapacityOk) {
+        if (profile) profile_record.status = PROFILE_SLACK_OVERLOAD;
         // Slack generator exceeds Pmax - insufficient generation capacity
         // This is treated as a failure, similar to divergence
 #ifdef USE_SUCCESS
@@ -856,6 +968,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
             events[task_id].p_name.c_str());
         if (print_calcs) pf_app.print(sbuf);
       } else {
+        if (profile) profile_record.status = PROFILE_CONVERGED;
         // Power flow solved and slack within capacity
 #ifdef USE_SUCCESS
         contingency_success.push_back(true);
@@ -919,98 +1032,88 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       // Get strings of data from power flow calculation and parse them to
       // extract numerical values. Store these values in vectors and then
       // add them to StatBlock objects
-#ifdef USE_STATBLOCK
-      timer->start(t_store);
-      vmag.clear();
-      vang.clear();
-      mask.clear();
-      mag_mask.clear();
-      v_vals.clear();
-      v_vals = pf_app.writeBusString("vr_str");
-      nsize = v_vals.size();
-      for (i=0; i<nsize; i++) {
-        std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-        int not_isolated = atoi(tokens[3].c_str());
-        if (not_isolated == 1) {
-          vmag.push_back(atof(tokens[2].c_str()));
-          if (atoi(tokens[4].c_str()) != 0) {
-            mag_mask.push_back(2);
-          } else {
-            mag_mask.push_back(1);
+      if (write_stats) {
+        timer->start(t_store);
+        vmag.clear();
+        vang.clear();
+        mask.clear();
+        mag_mask.clear();
+        v_vals.clear();
+        v_vals = pf_app.writeBusString("vr_str");
+        nsize = v_vals.size();
+        for (i=0; i<nsize; i++) {
+          std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+          int not_isolated = atoi(tokens[3].c_str());
+          if (not_isolated == 1) {
+            vmag.push_back(atof(tokens[2].c_str()));
+            if (atoi(tokens[4].c_str()) != 0) {
+              mag_mask.push_back(2);
+            } else {
+              mag_mask.push_back(1);
+            }
           }
-        }
-        vang.push_back(atof(tokens[1].c_str()));
-        mask.push_back(1);
-      }
-#endif
-#ifdef USE_STATBLOCK
-      if (task_comm.rank() == 0) {
-        vmag_stats.addColumnValues(task_id+1,vmag,mag_mask);
-        vang_stats.addColumnValues(task_id+1,vang,mask);
-      }
-#endif
-#ifdef USE_STATBLOCK
-      pgen.clear();
-      qgen.clear();
-      mask.clear();
-      v_vals.clear();
-      v_vals = pf_app.writeBusString("power");
-      nsize = v_vals.size();
-      for (i=0; i<nsize; i++) {
-        std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-        if (tokens.size()%4 != 0) {
-          printf("Incorrect generator listing\n");
-          continue;
-        }
-        int ngen = tokens.size()/4;
-        for (j=0; j<ngen; j++) {
-          pgen.push_back(atof(tokens[j*4+2].c_str()));
-          qgen.push_back(atof(tokens[j*4+3].c_str()));
+          vang.push_back(atof(tokens[1].c_str()));
           mask.push_back(1);
         }
-      }
-#endif
-#ifdef USE_STATBLOCK
-      if (task_comm.rank() == 0) {
-        pgen_stats.addColumnValues(task_id+1,pgen,mask);
-        qgen_stats.addColumnValues(task_id+1,qgen,mask);
-      }
-#endif
-#ifdef USE_STATBLOCK
-      pflow.clear();
-      qflow.clear();
-      perf.clear();
-      mask.clear();
-      v_vals.clear();
-      v_vals = pf_app.writeBranchString("flow_str");
-      nsize = v_vals.size();
-      for (i=0; i<nsize; i++) {
-        std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-        if (tokens.size()%8 != 0) {
-          printf("Incorrect branch power flow listing\n");
-          continue;
+        if (task_comm.rank() == 0) {
+          vmag_stats->addColumnValues(task_id+1,vmag,mag_mask);
+          vang_stats->addColumnValues(task_id+1,vang,mask);
         }
-        int nline = tokens.size()/8;
-        for (j=0; j<nline; j++) {
-          pflow.push_back(atof(tokens[j*8+3].c_str()));
-          qflow.push_back(atof(tokens[j*8+4].c_str()));
-          perf.push_back(atof(tokens[j*8+5].c_str()));
-          if (atoi(tokens[j*8+7].c_str()) == 0) {
+        pgen.clear();
+        qgen.clear();
+        mask.clear();
+        v_vals.clear();
+        v_vals = pf_app.writeBusString("power");
+        nsize = v_vals.size();
+        for (i=0; i<nsize; i++) {
+          std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+          if (tokens.size()%4 != 0) {
+            printf("Incorrect generator listing\n");
+            continue;
+          }
+          int ngen = tokens.size()/4;
+          for (j=0; j<ngen; j++) {
+            pgen.push_back(atof(tokens[j*4+2].c_str()));
+            qgen.push_back(atof(tokens[j*4+3].c_str()));
             mask.push_back(1);
-          } else {
-            mask.push_back(2);
           }
         }
+        if (task_comm.rank() == 0) {
+          pgen_stats->addColumnValues(task_id+1,pgen,mask);
+          qgen_stats->addColumnValues(task_id+1,qgen,mask);
+        }
+        pflow.clear();
+        qflow.clear();
+        perf.clear();
+        mask.clear();
+        v_vals.clear();
+        v_vals = pf_app.writeBranchString("flow_str");
+        nsize = v_vals.size();
+        for (i=0; i<nsize; i++) {
+          std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+          if (tokens.size()%8 != 0) {
+            printf("Incorrect branch power flow listing\n");
+            continue;
+          }
+          int nline = tokens.size()/8;
+          for (j=0; j<nline; j++) {
+            pflow.push_back(atof(tokens[j*8+3].c_str()));
+            qflow.push_back(atof(tokens[j*8+4].c_str()));
+            perf.push_back(atof(tokens[j*8+5].c_str()));
+            if (atoi(tokens[j*8+7].c_str()) == 0) {
+              mask.push_back(1);
+            } else {
+              mask.push_back(2);
+            }
+          }
+        }
+        if (task_comm.rank() == 0) {
+          pflow_stats->addColumnValues(task_id+1,pflow,mask);
+          qflow_stats->addColumnValues(task_id+1,qflow,mask);
+          perf_stats->addColumnValues(task_id+1,perf,mask);
+        }
+        timer->stop(t_store);
       }
-#endif
-#ifdef USE_STATBLOCK
-      if (task_comm.rank() == 0) {
-        pflow_stats.addColumnValues(task_id+1,pflow,mask);
-        qflow_stats.addColumnValues(task_id+1,qflow,mask);
-        perf_stats.addColumnValues(task_id+1,perf,mask);
-      }
-      timer->stop(t_store);
-#endif
         // Note: clearQlimViolations() moved after unSetContingency() below
       }  // end slackCapacityOk block
     } else {
@@ -1041,90 +1144,80 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       if (print_calcs) pf_app.print(sbuf);
       // Add dummy values to StatBlock object. Mask value is set to 0 for all
       // network elements to indicate calculation failure
-#ifdef USE_STATBLOCK
-      timer->start(t_store);
-      vmag.clear();
-      vang.clear();
-      mask.clear();
-      mag_mask.clear();
-      v_vals.clear();
-      v_vals = pf_app.writeBusString("vfail_str");
-      nsize = v_vals.size();
-      for (i=0; i<nsize; i++) {
-        std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-        int not_isolated = atoi(tokens[3].c_str());
-        if (not_isolated == 1) {
-          vmag.push_back(0.0);
-          mag_mask.push_back(0);
-        }
-        vang.push_back(0.0);
-        mask.push_back(0);
-      }
-#endif
-#ifdef USE_STATBLOCK
-      if (task_comm.rank() == 0) {
-        vmag_stats.addColumnValues(task_id+1,vmag,mag_mask);
-        vang_stats.addColumnValues(task_id+1,vang,mask);
-      }
-#endif
-#ifdef USE_STATBLOCK
-      pgen.clear();
-      qgen.clear();
-      mask.clear();
-      v_vals.clear();
-      v_vals = pf_app.writeBusString("pfail_str");
-      nsize = v_vals.size();
-      for (i=0; i<nsize; i++) {
-        std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-        if (tokens.size()%4 != 0) {
-          printf("Incorrect generator listing\n");
-          continue;
-        }
-        int ngen = tokens.size()/4;
-        for (j=0; j<ngen; j++) {
-          pgen.push_back(0.0);
-          qgen.push_back(0.0);
+      if (write_stats) {
+        timer->start(t_store);
+        vmag.clear();
+        vang.clear();
+        mask.clear();
+        mag_mask.clear();
+        v_vals.clear();
+        v_vals = pf_app.writeBusString("vfail_str");
+        nsize = v_vals.size();
+        for (i=0; i<nsize; i++) {
+          std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+          int not_isolated = atoi(tokens[3].c_str());
+          if (not_isolated == 1) {
+            vmag.push_back(0.0);
+            mag_mask.push_back(0);
+          }
+          vang.push_back(0.0);
           mask.push_back(0);
         }
-      }
-#endif
-#ifdef USE_STATBLOCK
-      if (task_comm.rank() == 0) {
-        pgen_stats.addColumnValues(task_id+1,pgen,mask);
-        qgen_stats.addColumnValues(task_id+1,qgen,mask);
-      }
-#endif
-#ifdef USE_STATBLOCK
-      pflow.clear();
-      qflow.clear();
-      perf.clear();
-      mask.clear();
-      v_vals.clear();
-      v_vals = pf_app.writeBranchString("fail_str");
-      nsize = v_vals.size();
-      for (i=0; i<nsize; i++) {
-        std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
-        if (tokens.size()%8 != 0) {
-          printf("Incorrect branch power flow listing\n");
-          continue;
+        if (task_comm.rank() == 0) {
+          vmag_stats->addColumnValues(task_id+1,vmag,mag_mask);
+          vang_stats->addColumnValues(task_id+1,vang,mask);
         }
-        int nline = tokens.size()/8;
-        for (j=0; j<nline; j++) {
-          pflow.push_back(0.0);
-          qflow.push_back(0.0);
-          perf.push_back(0.0);
-          mask.push_back(0);
+        pgen.clear();
+        qgen.clear();
+        mask.clear();
+        v_vals.clear();
+        v_vals = pf_app.writeBusString("pfail_str");
+        nsize = v_vals.size();
+        for (i=0; i<nsize; i++) {
+          std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+          if (tokens.size()%4 != 0) {
+            printf("Incorrect generator listing\n");
+            continue;
+          }
+          int ngen = tokens.size()/4;
+          for (j=0; j<ngen; j++) {
+            pgen.push_back(0.0);
+            qgen.push_back(0.0);
+            mask.push_back(0);
+          }
         }
+        if (task_comm.rank() == 0) {
+          pgen_stats->addColumnValues(task_id+1,pgen,mask);
+          qgen_stats->addColumnValues(task_id+1,qgen,mask);
+        }
+        pflow.clear();
+        qflow.clear();
+        perf.clear();
+        mask.clear();
+        v_vals.clear();
+        v_vals = pf_app.writeBranchString("fail_str");
+        nsize = v_vals.size();
+        for (i=0; i<nsize; i++) {
+          std::vector<std::string> tokens = util.blankTokenizer(v_vals[i]);
+          if (tokens.size()%8 != 0) {
+            printf("Incorrect branch power flow listing\n");
+            continue;
+          }
+          int nline = tokens.size()/8;
+          for (j=0; j<nline; j++) {
+            pflow.push_back(0.0);
+            qflow.push_back(0.0);
+            perf.push_back(0.0);
+            mask.push_back(0);
+          }
+        }
+        if (task_comm.rank() == 0) {
+          pflow_stats->addColumnValues(task_id+1,pflow,mask);
+          qflow_stats->addColumnValues(task_id+1,qflow,mask);
+          perf_stats->addColumnValues(task_id+1,perf,mask);
+        }
+        timer->stop(t_store);
       }
-#endif
-#ifdef USE_STATBLOCK
-      if (task_comm.rank() == 0) {
-        pflow_stats.addColumnValues(task_id+1,pflow,mask);
-        qflow_stats.addColumnValues(task_id+1,qflow,mask);
-        perf_stats.addColumnValues(task_id+1,perf,mask);
-      }
-      timer->stop(t_store);
-#endif
     }
     // Return network to its original base case state
     pf_app.unSetContingency(events[task_id]);
@@ -1136,7 +1229,14 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     gridpack::powerflow::PFBus::clearQlimWarnings();
     // Close output file for this contingency
     if (print_calcs) pf_app.close();
+    if (profile && task_comm.rank() == 0) {
+      local_profile_indices.push_back(task_id);
+      local_profile_records.push_back(profile_record);
+    }
   }
+  timer->stop(t_tasks);
+  int t_output = timer->createCategory("Contingency: Output Pipeline");
+  timer->start(t_output);
   // Print statistics from task manager describing the number of tasks performed
   // per processor
   taskmgr.printStats();
@@ -1159,7 +1259,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   contingency_isolated.clear();
   for (i=0; i<ntasks; i++) contingency_idx.push_back(i);
   ca_success.getData(contingency_idx, contingency_success);
-  contingency_success.clear();
   ca_violation.getData(contingency_idx, contingency_violation);
   ca_isolated.getData(contingency_idx, contingency_isolated);
   // Write out stats on successful calculations
@@ -1189,6 +1288,81 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     fout.close();
   }
 #endif
+
+  if (profile) {
+    ca_profile->addElements(local_profile_indices, local_profile_records);
+    ca_profile->upload();
+    std::vector<int> all_profile_indices;
+    std::vector<CAProfileRecord> all_profile_records;
+    for (i=0; i<ntasks; i++) all_profile_indices.push_back(i);
+    ca_profile->getData(all_profile_indices, all_profile_records);
+    int base_replicas = task_comm.rank() == 0 ? 1 : 0;
+    world.sum(&base_replicas, 1);
+    int profile_write_ok = 1;
+    if (world.rank() == 0) {
+      std::ofstream profile_out(profile_file.c_str());
+      if (!profile_out) profile_write_ok = 0;
+      profile_out
+        << "task_id,contingency,type,status,power_flow_solves,"
+        << "linear_solves,newton_updates,reported_newton_iterations,"
+        << "controller_passes,area_interchange_passes,final_tolerance\n";
+      profile_out << -1
+        << ",\"base_case_world_rank_0_representative\",base_case,"
+        << (base_solve_ok ? "converged" : "divergent") << ","
+        << base_profile.powerFlowSolveCalls << ","
+        << base_profile.linearSolveCalls << ","
+        << base_profile.completedNewtonUpdates << ","
+        << base_profile.reportedNewtonIterations << ","
+        << base_profile.controllerLoopPasses << ","
+        << base_profile.areaInterchangePasses << ","
+        << std::setprecision(17) << base_profile.finalTolerance << "\n";
+
+      int status_counts[PROFILE_SLACK_OVERLOAD + 1] = {};
+      long long linear_solves = 0;
+      long long newton_updates = 0;
+      long long controller_passes = 0;
+      for (i=0; i<ntasks; i++) {
+        const CAProfileRecord& record = all_profile_records[i];
+        if (record.status >= PROFILE_CONVERGED &&
+            record.status <= PROFILE_SLACK_OVERLOAD) {
+          status_counts[record.status]++;
+        }
+        linear_solves += record.linearSolveCalls;
+        newton_updates += record.completedNewtonUpdates;
+        controller_passes += record.controllerLoopPasses;
+        profile_out << i << "," << csvField(events[i].p_name) << ","
+          << (events[i].p_type == Branch ? "branch" : "generator") << ","
+          << profileStatusName(record.status) << ","
+          << record.powerFlowSolveCalls << ","
+          << record.linearSolveCalls << ","
+          << record.completedNewtonUpdates << ","
+          << record.reportedNewtonIterations << ","
+          << record.controllerLoopPasses << ","
+          << record.areaInterchangePasses << ","
+          << std::setprecision(17) << record.finalTolerance << "\n";
+      }
+      profile_out.close();
+      if (!profile_out) profile_write_ok = 0;
+      std::cout << "CA_PROFILE_SUMMARY"
+        << " converged=" << status_counts[PROFILE_CONVERGED]
+        << " divergent=" << status_counts[PROFILE_DIVERGENT]
+        << " islanded=" << status_counts[PROFILE_ISLANDED]
+        << " rejected=" << status_counts[PROFILE_REJECTED]
+        << " slack_overload=" << status_counts[PROFILE_SLACK_OVERLOAD]
+        << " base_replicas=" << base_replicas
+        << " base_linear_solves_per_replica="
+        << base_profile.linearSolveCalls
+        << " contingency_linear_solves=" << linear_solves
+        << " contingency_newton_updates=" << newton_updates
+        << " contingency_controller_passes=" << controller_passes
+        << std::endl;
+    }
+    world.min(&profile_write_ok, 1);
+    if (profile_write_ok == 0) {
+      throw gridpack::Exception(
+          "Unable to write contingency profile file " + profile_file);
+    }
+  }
 
   // Sync GA before MPI collectives to flush any pending one-sided operations
   world.sync();
@@ -1407,27 +1581,28 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   }
 
   // Print out statistics on contingencies
-#ifdef USE_STATBLOCK
-  int t_stats = timer->createCategory("Write Statistics");
-  timer->start(t_stats);
-  vmag_stats.writeMeanAndRMS("vmag.txt",1,false);
-  vmag_stats.writeMinAndMax("vmag_mm.txt",1,false);
-  if (check_Qlim) vmag_stats.writeMaskValueCount("pq_change_cnt.txt",2,false);
-  vang_stats.writeMeanAndRMS("vang.txt",1,false);
-  vang_stats.writeMinAndMax("vang_mm.txt",1,false);
-  pgen_stats.writeMeanAndRMS("pgen.txt",1);
-  pgen_stats.writeMinAndMax("pgen_mm.txt",1);
-  qgen_stats.writeMeanAndRMS("qgen.txt",1);
-  qgen_stats.writeMinAndMax("qgen_mm.txt",1);
-  pflow_stats.writeMeanAndRMS("pflow.txt",1);
-  pflow_stats.writeMinAndMax("pflow_mm.txt",1);
-  pflow_stats.writeMaskValueCount("line_flt_cnt.txt",2);
-  qflow_stats.writeMeanAndRMS("qflow.txt",1);
-  qflow_stats.writeMinAndMax("qflow_mm.txt",1);
-  perf_stats.writeMinAndMax("perf_mm.txt",1);
-  perf_stats.sumColumnValues("perf_sum.txt",1);
-  timer->stop(t_stats);
-#endif
+  if (write_stats) {
+    int t_stats = timer->createCategory("Write Statistics");
+    timer->start(t_stats);
+    vmag_stats->writeMeanAndRMS("vmag.txt",1,false);
+    vmag_stats->writeMinAndMax("vmag_mm.txt",1,false);
+    if (check_Qlim) vmag_stats->writeMaskValueCount("pq_change_cnt.txt",2,false);
+    vang_stats->writeMeanAndRMS("vang.txt",1,false);
+    vang_stats->writeMinAndMax("vang_mm.txt",1,false);
+    pgen_stats->writeMeanAndRMS("pgen.txt",1);
+    pgen_stats->writeMinAndMax("pgen_mm.txt",1);
+    qgen_stats->writeMeanAndRMS("qgen.txt",1);
+    qgen_stats->writeMinAndMax("qgen_mm.txt",1);
+    pflow_stats->writeMeanAndRMS("pflow.txt",1);
+    pflow_stats->writeMinAndMax("pflow_mm.txt",1);
+    pflow_stats->writeMaskValueCount("line_flt_cnt.txt",2);
+    qflow_stats->writeMeanAndRMS("qflow.txt",1);
+    qflow_stats->writeMinAndMax("qflow_mm.txt",1);
+    perf_stats->writeMinAndMax("perf_mm.txt",1);
+    perf_stats->sumColumnValues("perf_sum.txt",1);
+    timer->stop(t_stats);
+  }
+  timer->stop(t_output);
   timer->stop(t_total);
   // If all processors executed at least one task, then print out timing
   // statistics (this printout does not work if some processors do not define
@@ -1436,4 +1611,3 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     timer->dump();
   }
 }
-
