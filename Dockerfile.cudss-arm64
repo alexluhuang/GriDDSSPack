@@ -63,7 +63,8 @@ RUN cmake -S /workspace/src -B /workspace/build \
       -D MPI_C_COMPILER:FILEPATH=/usr/bin/mpicc \
       -D MPI_CXX_COMPILER:FILEPATH=/usr/bin/mpicxx \
       -D MPIEXEC_EXECUTABLE:FILEPATH=/usr/bin/mpiexec \
-    && cmake --build /workspace/build --target ca.x --parallel
+    && cmake --build /workspace/build \
+       --target ca.x cudss_broker_benchmark --parallel
 
 RUN mkdir -p \
       /opt/gridpack/bin \
@@ -71,11 +72,14 @@ RUN mkdir -p \
       /opt/gridpack/share/gridpack/smoke/contingency_analysis \
     && cp /workspace/build/applications/contingency_analysis/ca.x \
        /opt/gridpack/bin/ca.x \
+    && cp /workspace/build/math/cudss_broker_benchmark \
+       /opt/gridpack/bin/cudss_broker_benchmark \
     && find /workspace/build \
        \( -type f -o -type l \) -name 'libgridpack*.so*' \
        -exec cp -a -t /opt/gridpack/lib {} + \
     && cp \
        /workspace/src/applications/data_sets/input/ca/input_14_auto_n1.xml \
+       /workspace/src/applications/data_sets/input/ca/input_14_cudss_broker.xml \
        /workspace/src/applications/data_sets/raw/IEEE14_ca.raw \
        /opt/gridpack/share/gridpack/smoke/contingency_analysis/
 

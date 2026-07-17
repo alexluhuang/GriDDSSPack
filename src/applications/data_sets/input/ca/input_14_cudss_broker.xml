@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Configuration>
+  <Contingency_analysis>
+    <printCalcFiles>false</printCalcFiles>
+    <writeStats>false</writeStats>
+    <FullBranchN1>true</FullBranchN1>
+    <FullGeneratorN1>true</FullGeneratorN1>
+    <groupSize>1</groupSize>
+    <maxVoltage>1.1</maxVoltage>
+    <minVoltage>0.9</minVoltage>
+    <qlim>false</qlim>
+    <outputFormat>text</outputFormat>
+    <CUDSSBroker>
+      <Enabled>true</Enabled>
+      <Device>0</Device>
+      <BatchSize>8</BatchSize>
+      <MinimumGpuBatchSize>8</MinimumGpuBatchSize>
+      <BatchWaitMicroseconds>50000</BatchWaitMicroseconds>
+      <MaximumRegisteredPatterns>16</MaximumRegisteredPatterns>
+      <MaximumDevicePatterns>8</MaximumDevicePatterns>
+      <ScheduleByExpectedPattern>true</ScheduleByExpectedPattern>
+      <ValidateResiduals>true</ValidateResiduals>
+      <ResidualTolerance>1.0e-10</ResidualTolerance>
+      <Strict>false</Strict>
+      <Diagnostics>false</Diagnostics>
+    </CUDSSBroker>
+  </Contingency_analysis>
+  <Powerflow>
+    <networkConfiguration>IEEE14_ca.raw</networkConfiguration>
+    <maxIteration>50</maxIteration>
+    <tolerance>1.0e-3</tolerance>
+    <qlim>false</qlim>
+    <LinearSolver>
+      <Backend>petsc</Backend>
+      <PETScOptions>
+        -ksp_type preonly
+        -pc_type lu
+        -pc_factor_mat_solver_type klu
+      </PETScOptions>
+    </LinearSolver>
+  </Powerflow>
+</Configuration>

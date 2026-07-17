@@ -31,6 +31,16 @@
       </LinearSolver>
     </CUDSSDeviceValidation>
 
+    <CUDSSDeviceLRUValidation>
+      <LinearSolver>
+        <Backend>cudss</Backend>
+        <CUDSSMode>device</CUDSSMode>
+        <CUDSSStrict>false</CUDSSStrict>
+        <CUDSSCacheMaxEntries>2</CUDSSCacheMaxEntries>
+        <CUDSSResidualTolerance>1.0E-10</CUDSSResidualTolerance>
+      </LinearSolver>
+    </CUDSSDeviceLRUValidation>
+
     <CUDSSHybridValidation>
       <LinearSolver>
         <Backend>cudss</Backend>

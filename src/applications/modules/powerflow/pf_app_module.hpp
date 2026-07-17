@@ -34,6 +34,8 @@
 #include "boost/smart_ptr/shared_ptr.hpp"
 #include "gridpack/serial_io/serial_io.hpp"
 #include "gridpack/configuration/configuration.hpp"
+#include "gridpack/math/matrix.hpp"
+#include "gridpack/math/vector.hpp"
 #include "pf_factory_module.hpp"
 #include "gridpack/parser/dictionary.hpp"
 #include "gridpack/utilities/string_utils.hpp"
@@ -41,6 +43,8 @@
 
 namespace gridpack {
 namespace powerflow {
+
+class PFMapperWorkspace;
 
 // Structs that are used for some applications
 
@@ -98,6 +102,47 @@ struct PFSolveMetrics
   int controllerLoopPasses;
   // Area-interchange-loop passes entered
   int areaInterchangePasses;
+  // Controller passes that rebuilt at least one structural workspace
+  int mapperWorkspaceRebuilds;
+  // Controller passes that reused both mapper/storage workspaces
+  int mapperWorkspaceReuses;
+};
+
+/**
+ * One assembled Newton linear system and the context needed by an external
+ * executor.  The referenced matrix, vectors, and context are valid only for
+ * the duration of PFLinearSystemExecutor::solve().
+ */
+struct PFLinearSystem
+{
+  const gridpack::math::RealMatrix& matrix;
+  const gridpack::math::RealVector& rightHandSide;
+  gridpack::math::RealVector& solution;
+  std::string caseName;
+  bool baseCase;
+  int areaInterchangePass;
+  int controllerPass;
+  int newtonIteration;
+  int linearSolveOrdinal;
+};
+
+/**
+ * Synchronous boundary between Newton assembly and correction application.
+ * Implementations may solve locally or block while a remote/batched executor
+ * supplies the correction.  PFAppModule retains ownership of all referenced
+ * data.
+ */
+class PFLinearSystemExecutor
+{
+  public:
+    virtual ~PFLinearSystemExecutor(void) {}
+    /**
+     * Fully overwrite system.solution and return true, or return false to
+     * request the normal configured GridPACK linear-solver path. Exceptions
+     * are fatal external-executor failures and propagate from
+     * PFAppModule::solve().
+     */
+    virtual bool solve(PFLinearSystem& system) = 0;
 };
 
 // Calling program for powerflow application
@@ -145,6 +190,13 @@ class PFAppModule
      * @return false if an error was caught in the solution algorithm
      */
     bool solve();
+
+    /**
+     * Install a non-owning external linear-system executor. The executor must
+     * outlive this PFAppModule or be cleared by passing NULL. Passing NULL
+     * restores the existing GridPACK RealLinearSolver path.
+     */
+    void setLinearSystemExecutor(PFLinearSystemExecutor *executor);
 
     /**
      * Execute the iterative solve portion of the application using a library
@@ -1024,6 +1076,13 @@ class PFAppModule
 
     // Execution counts from the most recent hand-coded solve
     PFSolveMetrics p_solveMetrics;
+
+    // Optional non-owning executor used at the Newton linear-system boundary
+    PFLinearSystemExecutor *p_linearSystemExecutor;
+
+    // Persistent mapper and linear-system storage. The implementation keeps
+    // this opaque because mapper types are implementation details of solve().
+    boost::shared_ptr<PFMapperWorkspace> p_mapperWorkspace;
 
 #ifdef USE_GOSS
     gridpack::goss::GOSSClient p_goss_client;

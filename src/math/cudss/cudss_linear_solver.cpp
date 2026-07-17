@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <list>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -134,6 +135,7 @@ public:
       p_diagnostics(false),
       p_mode(CUDSS_DEVICE_MODE),
       p_device(0),
+      p_cacheMaxEntries(8),
       p_residualTolerance(1.0e-10),
       p_lastFallbackReason(),
       p_statistics()
@@ -154,6 +156,7 @@ public:
               << (p_statistics.cudssCompiled ? "true" : "false")
               << " owner_world_rank=" << p_statistics.ownerWorldRank
               << " device=" << p_statistics.device
+              << " cache_max_entries=" << p_cacheMaxEntries
               << " analyses=" << p_statistics.analyses
               << " factorizations=" << p_statistics.factorizations
               << " refactorizations=" << p_statistics.refactorizations
@@ -186,6 +189,7 @@ protected:
   bool p_diagnostics;
   CUDSSExecutionMode p_mode;
   int p_device;
+  std::size_t p_cacheMaxEntries;
   double p_residualTolerance;
   mutable std::string p_lastFallbackReason;
   mutable LinearSolverStatistics p_statistics;
@@ -198,6 +202,13 @@ protected:
       p_strict = props->get("CUDSSStrict", p_strict);
       p_diagnostics = props->get("CUDSSDiagnostics", p_diagnostics);
       p_device = props->get("CUDSSDevice", p_device);
+      const int configuredCacheMaxEntries = props->get(
+        "CUDSSCacheMaxEntries", static_cast<int>(p_cacheMaxEntries));
+      if (configuredCacheMaxEntries <= 0) {
+        fail("CUDSSCacheMaxEntries must be positive");
+      }
+      p_cacheMaxEntries =
+        static_cast<std::size_t>(configuredCacheMaxEntries);
       p_residualTolerance =
         props->get("CUDSSResidualTolerance", p_residualTolerance);
 
@@ -216,6 +227,14 @@ protected:
     p_diagnostics =
       environmentBoolean("GRIDPACK_CUDSS_DIAGNOSTICS", p_diagnostics);
     p_device = environmentInteger("GRIDPACK_CUDSS_DEVICE", p_device);
+    const int environmentCacheMaxEntries = environmentInteger(
+      "GRIDPACK_CUDSS_CACHE_MAX_ENTRIES",
+      static_cast<int>(p_cacheMaxEntries));
+    if (environmentCacheMaxEntries <= 0) {
+      fail("GRIDPACK_CUDSS_CACHE_MAX_ENTRIES must be positive");
+    }
+    p_cacheMaxEntries =
+      static_cast<std::size_t>(environmentCacheMaxEntries);
     p_residualTolerance = environmentDouble(
       "GRIDPACK_CUDSS_RESIDUAL_TOLERANCE", p_residualTolerance);
     const char *environmentMode = std::getenv("GRIDPACK_CUDSS_MODE");
@@ -634,6 +653,12 @@ public:
   void synchronize(void) const
   {
     p_stream.synchronize();
+  }
+
+  void drainNoThrow(void) const
+  {
+    cudaStreamSynchronize(p_stream.get());
+    cudaGetLastError();
   }
 
   void execute(int phase, const CudssData& data,
@@ -1259,6 +1284,127 @@ private:
   CudssData p_data;
 };
 
+class RuntimeCache
+{
+public:
+  RuntimeCache(int device, CUDSSExecutionMode mode,
+               std::size_t maxEntries)
+    : p_device(device),
+      p_mode(mode),
+      p_maxEntries(maxEntries),
+      p_runtime(new CudssRuntime(mode)),
+      p_patterns()
+  {}
+
+  ~RuntimeCache(void)
+  {
+    cudaSetDevice(p_device);
+    p_patterns.clear();
+    p_runtime.reset();
+  }
+
+  int device(void) const
+  {
+    return p_device;
+  }
+
+  CUDSSExecutionMode mode(void) const
+  {
+    return p_mode;
+  }
+
+  CudssRuntime& runtime(void) const
+  {
+    return *p_runtime;
+  }
+
+  std::size_t maxEntries(void) const
+  {
+    return p_maxEntries;
+  }
+
+  PatternState *find(const HostSystem& system)
+  {
+    for (PatternList::iterator state = p_patterns.begin();
+         state != p_patterns.end(); ++state) {
+      if ((*state)->matchesPattern(system)) {
+        PatternState *result = state->get();
+        p_patterns.splice(p_patterns.begin(), p_patterns, state);
+        return result;
+      }
+    }
+    return NULL;
+  }
+
+  PatternState *insert(const HostSystem& system)
+  {
+    while (p_patterns.size() >= p_maxEntries) {
+      p_patterns.pop_back();
+    }
+    std::unique_ptr<PatternState> state(
+      new PatternState(system, p_mode, *p_runtime));
+    PatternState *result = state.get();
+    p_patterns.push_front(std::move(state));
+    return result;
+  }
+
+  void erase(PatternState *state)
+  {
+    if (state == NULL) return;
+    for (PatternList::iterator iter = p_patterns.begin();
+         iter != p_patterns.end(); ++iter) {
+      if (iter->get() == state) {
+        p_patterns.erase(iter);
+        return;
+      }
+    }
+  }
+
+private:
+  RuntimeCache(const RuntimeCache&);
+  RuntimeCache& operator=(const RuntimeCache&);
+
+  typedef std::list<std::unique_ptr<PatternState> > PatternList;
+
+  int p_device;
+  CUDSSExecutionMode p_mode;
+  std::size_t p_maxEntries;
+  std::unique_ptr<CudssRuntime> p_runtime;
+  PatternList p_patterns;
+};
+
+class ProcessCache
+{
+public:
+  RuntimeCache& get(int device, CUDSSExecutionMode mode,
+                    std::size_t maxEntries)
+  {
+    for (RuntimeList::iterator runtime = p_runtimes.begin();
+         runtime != p_runtimes.end(); ++runtime) {
+      if ((*runtime)->device() == device && (*runtime)->mode() == mode &&
+          (*runtime)->maxEntries() == maxEntries) {
+        return *(*runtime);
+      }
+    }
+
+    std::unique_ptr<RuntimeCache> runtime(
+      new RuntimeCache(device, mode, maxEntries));
+    RuntimeCache *result = runtime.get();
+    p_runtimes.push_back(std::move(runtime));
+    return *result;
+  }
+
+private:
+  typedef std::vector<std::unique_ptr<RuntimeCache> > RuntimeList;
+  RuntimeList p_runtimes;
+};
+
+ProcessCache& processCache(void)
+{
+  static ProcessCache cache;
+  return cache;
+}
+
 std::mutex& executionMutex(void)
 {
   static std::mutex mutex;
@@ -1274,16 +1420,12 @@ public:
     utility::Configuration::CursorPtr parentConfiguration)
     : CUDSSLinearSolverBase(matrix, parentConfiguration, true),
       p_available(false),
-      p_unavailableReason("cuDSS was not configured"),
-      p_runtime(),
-      p_patterns()
+      p_unavailableReason("cuDSS was not configured")
   {}
 
 protected:
   mutable bool p_available;
   mutable std::string p_unavailableReason;
-  mutable std::unique_ptr<CudssRuntime> p_runtime;
-  mutable std::vector<std::unique_ptr<PatternState> > p_patterns;
 
   void p_configureBackend(void)
   {
@@ -1318,6 +1460,7 @@ protected:
     }
 
     try {
+      std::lock_guard<std::mutex> lock(executionMutex());
       int deviceCount = 0;
       checkCUDA(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount");
       if (p_device >= deviceCount) {
@@ -1331,7 +1474,7 @@ protected:
       checkCUDA(cudaSetDevice(p_device), "cudaSetDevice");
       checkCUDA(cudaFree(NULL), "cudaFree(NULL)");
 
-      p_runtime.reset(new CudssRuntime(p_mode));
+      processCache().get(p_device, p_mode, p_cacheMaxEntries);
       p_available = true;
       p_unavailableReason.clear();
       p_statistics.deviceOwner = true;
@@ -1358,23 +1501,10 @@ private:
   {
     p_available = false;
     p_unavailableReason = reason;
-    p_patterns.clear();
-    p_runtime.reset();
     p_statistics.deviceOwner = false;
     p_statistics.ownerWorldRank = -1;
     p_statistics.device = -1;
     p_unavailable(reason);
-  }
-
-  PatternState *p_findPattern(const HostSystem& system) const
-  {
-    for (std::vector<std::unique_ptr<PatternState> >::iterator state =
-           p_patterns.begin(); state != p_patterns.end(); ++state) {
-      if ((*state)->matchesPattern(system)) {
-        return state->get();
-      }
-    }
-    return NULL;
   }
 
   void p_solveCUDSS(MatrixType& matrix, const VectorType& b,
@@ -1386,56 +1516,68 @@ private:
     }
 
     try {
-      std::lock_guard<std::mutex> lock(executionMutex());
-      checkCUDA(cudaSetDevice(p_device), "cudaSetDevice");
-
       const HostSystem system = extractHostSystem(matrix, b);
-      PatternState *state = p_findPattern(system);
-      if (state == NULL) {
-        ++p_statistics.cacheMisses;
-        std::unique_ptr<PatternState> newState(
-          new PatternState(system, p_mode, *p_runtime));
-        state = newState.get();
-        p_patterns.push_back(std::move(newState));
+      std::vector<double> solution;
+      {
+        std::lock_guard<std::mutex> lock(executionMutex());
+        checkCUDA(cudaSetDevice(p_device), "cudaSetDevice");
 
-        p_runtime->execute(
-          CUDSS_PHASE_ANALYSIS, state->data(), state->matrix(),
-          state->solutionMatrix(), state->rhsMatrix(), "analysis");
-        ++p_statistics.analyses;
+        RuntimeCache& cache =
+          processCache().get(p_device, p_mode, p_cacheMaxEntries);
+        CudssRuntime& runtime = cache.runtime();
+        PatternState *state = NULL;
+        try {
+          state = cache.find(system);
+          if (state == NULL) {
+            ++p_statistics.cacheMisses;
+            state = cache.insert(system);
 
-        p_runtime->execute(
-          CUDSS_PHASE_FACTORIZATION, state->data(), state->matrix(),
-          state->solutionMatrix(), state->rhsMatrix(), "factorization");
-        ++p_statistics.factorizations;
-      } else {
-        ++p_statistics.cacheHits;
-        if (!state->matchesValues(system)) {
-          state->updateValues(system, *p_runtime);
-          p_runtime->execute(
-            CUDSS_PHASE_REFACTORIZATION, state->data(), state->matrix(),
-            state->solutionMatrix(), state->rhsMatrix(), "refactorization");
-          ++p_statistics.refactorizations;
+            runtime.execute(
+              CUDSS_PHASE_ANALYSIS, state->data(), state->matrix(),
+              state->solutionMatrix(), state->rhsMatrix(), "analysis");
+            ++p_statistics.analyses;
+
+            runtime.execute(
+              CUDSS_PHASE_FACTORIZATION, state->data(), state->matrix(),
+              state->solutionMatrix(), state->rhsMatrix(), "factorization");
+            ++p_statistics.factorizations;
+          } else {
+            ++p_statistics.cacheHits;
+            if (!state->matchesValues(system)) {
+              state->updateValues(system, runtime);
+              runtime.execute(
+                CUDSS_PHASE_REFACTORIZATION, state->data(), state->matrix(),
+                state->solutionMatrix(), state->rhsMatrix(),
+                "refactorization");
+              ++p_statistics.refactorizations;
+            }
+          }
+
+          state->prepareRightHandSide(system, runtime);
+          runtime.execute(
+            CUDSS_PHASE_SOLVE, state->data(), state->matrix(),
+            state->solutionMatrix(), state->rhsMatrix(), "solve");
+          ++p_statistics.solves;
+
+          solution = state->captureSolution(runtime);
+          const double residual = scaledResidual(system, solution);
+          p_statistics.lastScaledResidual = residual;
+          if (!std::isfinite(residual) || residual > p_residualTolerance) {
+            std::ostringstream message;
+            message << "scaled residual " << residual
+                    << " exceeds CUDSSResidualTolerance "
+                    << p_residualTolerance;
+            fail(message.str());
+          }
+        } catch (...) {
+          // A failed matrix/data operation must not leave reusable cuDSS
+          // state behind. Drain queued work before destroying descriptors;
+          // unrelated cached patterns remain valid.
+          runtime.drainNoThrow();
+          cache.erase(state);
+          throw;
         }
       }
-
-      state->prepareRightHandSide(system, *p_runtime);
-      p_runtime->execute(
-        CUDSS_PHASE_SOLVE, state->data(), state->matrix(),
-        state->solutionMatrix(), state->rhsMatrix(), "solve");
-      ++p_statistics.solves;
-
-      const std::vector<double> solution =
-        state->captureSolution(*p_runtime);
-      const double residual = scaledResidual(system, solution);
-      p_statistics.lastScaledResidual = residual;
-      if (!std::isfinite(residual) || residual > p_residualTolerance) {
-        std::ostringstream message;
-        message << "scaled residual " << residual
-                << " exceeds CUDSSResidualTolerance "
-                << p_residualTolerance;
-        fail(message.str());
-      }
-
       writeSolution(solution, matrix, x);
     } catch (const std::exception& error) {
       p_available = false;

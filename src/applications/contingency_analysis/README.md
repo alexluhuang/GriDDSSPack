@@ -44,12 +44,19 @@ When combined, duplicates from the file are automatically skipped.
 | `maxVoltage` | Maximum voltage threshold for violations (p.u.) | 1.1 |
 | `qlim` | Enable reactive power limit enforcement (PV to PQ bus conversion) | false |
 
+`CUDSSBroker.ScheduleByExpectedPattern` is an opt-in cuDSS broker setting. It
+derives expected initial Jacobian-layout classes from the loaded network,
+groups matching contingencies into batch-aligned execution epochs, and
+preserves the original contingency IDs used by task-indexed outputs. Its
+default is `false`, retaining input-order dynamic scheduling as the validated
+baseline.
+
 Profiling can also be enabled without editing the input file by setting
 `GRIDPACK_CA_PROFILE=1`. The CSV includes outcome classification, Newton and
-linear-solve counts, controller passes, and final tolerance for every
-contingency. Its task `-1` row is the world-rank-zero base-case replica; the
-console summary reports the number of base replicas separately and labels
-contingency-only totals explicitly.
+linear-solve counts, controller passes, mapper-workspace rebuild/reuse counts,
+and final tolerance for every contingency. Its task `-1` row is the
+world-rank-zero base-case replica; the console summary reports the number of
+base replicas separately and labels contingency-only totals explicitly.
 
 ### Contingency File Format
 

@@ -84,6 +84,8 @@ if (PETSC_FOUND)
     petsc/petsc_matrix_operations.cpp
     petsc/petsc_matrix_wrapper.cpp
     petsc/petsc_csr_exporter.cpp
+    cudss/cudss_batch_solver.cpp
+    cudss/cudss_mpi_broker.cpp
     cudss/cudss_linear_solver.cpp
     petsc/petsc_matrix.cpp
     petsc/petsc_linear_solver.cpp
@@ -355,6 +357,35 @@ if (PETSC_FOUND)
   add_dependencies(cudss_linear_solver_test math_test_input)
 endif()
 
+add_executable(cudss_batch_solver_test
+  test/cudss_batch_solver_test.cpp)
+target_link_libraries(cudss_batch_solver_test
+  gridpack_math ${target_libraries})
+gridpack_add_serial_unit_test(cudss_batch_solver
+  cudss_batch_solver_test)
+if (PETSC_FOUND)
+  add_dependencies(cudss_batch_solver_test math_test_input)
+endif()
+
+add_executable(cudss_mpi_broker_test
+  test/cudss_mpi_broker_test.cpp)
+target_link_libraries(cudss_mpi_broker_test
+  gridpack_math ${target_libraries})
+if (MPIEXEC)
+  gridpack_add_parallel_unit_test(cudss_mpi_broker
+    cudss_mpi_broker_test)
+endif()
+if (PETSC_FOUND)
+  add_dependencies(cudss_mpi_broker_test math_test_input)
+endif()
+
+add_executable(cudss_broker_benchmark
+  cudss/cudss_broker_benchmark.cpp)
+target_link_libraries(cudss_broker_benchmark
+  gridpack_math ${target_libraries})
+install(TARGETS cudss_broker_benchmark
+  DESTINATION bin)
+
 # -------------------------------------------------------------
 # nonlinear solver test suite
 # -------------------------------------------------------------
@@ -409,6 +440,17 @@ target_link_libraries(bouncing_ball_test gridpack_math ${target_libraries})
 install(FILES 
   ${gridpack_math_headers}
   DESTINATION include/gridpack/math
+  )
+
+install(FILES
+  cudss/cudss_batch_solver.hpp
+  cudss/cudss_mpi_broker.hpp
+  DESTINATION include/gridpack/math/cudss
+  )
+
+install(FILES
+  petsc/petsc_csr_exporter.hpp
+  DESTINATION include/gridpack/math/petsc
   )
 
 install(TARGETS 

@@ -50,10 +50,18 @@ endif()
 
 add_executable(ca.x
    ca_driver.cpp
+   ca_pattern_scheduler.cpp
    ca_main.cpp
 )
 
 target_link_libraries(ca.x ${target_libraries})
+
+add_executable(ca_pattern_scheduler_test
+  ca_pattern_scheduler.cpp
+  test/ca_pattern_scheduler_test.cpp)
+target_link_libraries(ca_pattern_scheduler_test ${target_libraries})
+gridpack_add_serial_unit_test(ca_pattern_scheduler
+  ca_pattern_scheduler_test)
 
 # Put some sample input in the binary directory so ca.x can run
 
@@ -165,6 +173,8 @@ install(FILES
   ${GRIDPACK_DATA_DIR}/contingencies/contingencies_118.xml
   ${CMAKE_CURRENT_SOURCE_DIR}/ca_driver.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ca_driver.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ca_pattern_scheduler.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ca_pattern_scheduler.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ca_main.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/README.md
   DESTINATION share/gridpack/example/contingency_analysis
@@ -179,4 +189,3 @@ set(TIMEOUT 120.0)
 gridpack_add_run_test("contingency_analysis" ca.x input_14.xml)
 gridpack_add_run_test("contingency_analysis_auto_n1" ca.x input_14_auto_n1.xml)
 gridpack_add_run_test("contingency_analysis_qlim" ca.x input_14_qlim.xml)
-

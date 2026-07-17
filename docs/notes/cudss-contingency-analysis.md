@@ -481,10 +481,11 @@ after those measured costs. A scalar cuDSS result from every MPI rank is
 explicitly prohibited: `groupSize=1` creates 20 independent rank-local
 solvers, not 20 GPU owners.
 
-The current preliminary preference for a future batched path is the MPI
-broker because it preserves process isolation. No batched executor will be
-implemented until exported-system benchmarks and a transfer-cost spike
-support that choice.
+The implemented batched path is the MPI broker because it preserves process
+isolation. The final launch rank is the only CUDA/cuDSS owner; every other rank
+retains its own GridPACK network, controller state, and local KLU fallback. A
+dedicated duplicated communicator carries versioned registration, numeric,
+result, and terminal messages without sharing GridPACK/GA traffic.
 
 ## Solver integration decision
 
@@ -510,9 +511,10 @@ unexpected fallback into an error. Non-strict mode constructs PETSc/KLU only
 when it is actually needed. CPU-only builds and the default configuration
 retain the original path.
 
-This boundary is a correctness and lifecycle probe, not the eventual batched
-executor. The synchronous `solve()` interface cannot coordinate a nonlinear
-wavefront across independent contingencies.
+The scalar boundary remains a correctness and lifecycle probe. The power-flow
+module now also exposes an optional linear-system executor at both Newton solve
+sites. The existing `PFAppModule::solve()` remains the scalar wrapper; when an
+executor declines a system it lazily constructs the original PETSc/KLU solver.
 
 The implemented backend is build-time optional
 (`GRIDPACK_ENABLE_CUDSS=OFF` by default) and runtime opt-in. Existing XML
@@ -521,38 +523,93 @@ unchanged input with `GRIDPACK_LINEAR_SOLVER_BACKEND=cudss`; device/hybrid,
 strictness, device ID, residual tolerance, and diagnostics have corresponding
 optional XML keys and environment overrides.
 
-Each scalar solver owns a synchronized CUDA stream and cuDSS lifecycle. It
-copies and validates exact sequential PETSc CSR, caches analysis state by the
-full row-offset/column-index identity, runs refactorization when values change,
-and reuses the factor for repeated RHS data. Statistics expose analyses,
+Scalar solvers share a process-persistent runtime/cache partitioned by device,
+execution mode, and configured capacity. Exact row-offset/column-index identity
+keys an LRU of cuDSS analysis state, so destroying a short-lived GridPACK
+solver no longer destroys symbolic analysis. It refactorizes when values
+change and reuses the factor for repeated RHS data. Statistics expose analyses,
 factorizations, refactorizations, solves, cache hits/misses, fallbacks,
-residual, and owner identity. A global in-process mutex serializes cuDSS API
-execution. Eligibility requires both a size-one matrix communicator and
-`MPI_COMM_WORLD` size one/rank zero, so an MPI CA run cannot silently mix one
-GPU rank with CPU ranks.
+residual, and owner identity. A global in-process mutex serializes scalar cuDSS
+API execution. Eligibility still requires both a size-one matrix communicator
+and `MPI_COMM_WORLD` size one/rank zero, so an MPI CA run cannot accidentally
+create one scalar GPU owner per worker.
 
-Three focused serial tests passed in both a CUDA-free build and the CUDA
-13/cuDSS 0.8 build. The GPU run exercised device analysis/cache/refactor,
-hybrid execution, and strict residual failure; the CPU build exercised lazy
-PETSc fallback and strict no-fallback behavior.
+The final CUDA 13/cuDSS 0.8 builder run passed six PETSc CSR exporter tests,
+four scalar cuDSS tests with a required GPU, one uniform-batch test, four
+three-rank broker protocol tests, and three power-flow executor tests. These
+cover exact cache reuse and eviction, device/hybrid execution, non-finite input
+rejection, partial uniform batches, explicit fallback/error/drain paths, and
+lazy PETSc/KLU fallback at both Newton solve sites.
 
 ## Batch execution decision
 
-No production batch executor is selected from the present measurements. A
-linear-solver-only improvement is capped near 1.152x end to end, while scalar
-cuDSS pays a cold-analysis cost and the existing 20-rank CPU task farm already
-keeps all host cores productive. cuDSS uniform batching also requires exact
-pattern-compatible systems; hybrid mode is a separate scalar strategy.
+The production candidate is a uniform B=8 device batch owned by one broker
+rank. Workers register exact CSR structure once and thereafter send values plus
+RHS; the owner retains row/column arrays and cuDSS analysis in an exact-pattern
+LRU. Host values/RHS/solutions use reusable pinned buffers, device allocations
+are reused, and rare or undersized buckets return explicitly to local KLU in
+non-strict mode. cuDSS 0.8 executes every uniform slot, so production keeps
+`MinimumGpuBatchSize == BatchSize` instead of padding small timeout buckets.
 
-If work continues as a research prototype, the selected ownership model is a
-single world-rank GPU broker fed by process-isolated MPI workers. It retains
-the only currently proven isolation boundary and groups ready systems by
-exact CSR pattern. Before implementation it must demonstrate, with a bounded
-broker/transfer spike, throughput above the measured CPU farm after CSR
-packing, MPI transfer, synchronization, and result-return costs. Rare
-patterns retain PETSc/KLU. The one-process/multiple-live-state design remains
-rejected until process-static PF state is isolated and memory/state rollback
-are proven.
+The installed capture-replay benchmark times the actual PETSc CSR pack,
+versioned MPI protocol, host/device copies, refactorization, solve, and result
+return. The full-gate validation image
+(`sha256:c2aaeadbefccba53e3d93ac5f2a6d44408ca9a36091734b2faf9eee33bc4da2d`)
+produced these bounded GB10 results on 2026-07-16:
+
+| Uniform batch / workers | Repetitions | Timed systems | Systems/s | Above 735 KLU gate | Above 900 target |
+|---:|---:|---:|---:|:---:|:---:|
+| 4 | 50 | 200 | 642.538 | no | no |
+| 8 | 50 | 400 | 941.740 | yes | yes |
+| 16 | 50 | 800 | 136.997 | no | no |
+| 19 (worker maximum) | 20 | 380 | 156.023 | no | no |
+
+Every configuration had one registration, one analysis, one initial
+factorization, exact refactor/cache counts, zero retries/fallbacks/errors, and
+maximum scaled residual below `1.83e-18`. B=16 and B=19 expose a large cuDSS
+0.8 performance cliff; B=8 is therefore selected rather than assuming a larger
+batch is faster. The one-process/multiple-live-state design remains rejected
+because its process-static PF state and rollback behavior are not isolated.
+
+The first full B=8 run exposed a separate queue-latency effect: only 808 of
+28,496 linear systems formed a full batch, while 27,688 requests waited up to
+5 ms and then returned to local KLU. A stratified 988-contingency deck selected
+every ninth full-case event (907 branch and 81 generator contingencies). Its
+request count was within 0.9% of one ninth of the full run, and its 5 ms
+fallback count was within 0.08%. Two paired measurements gave:
+
+| Broker wait | Run 1 wall time | Run 2 wall time | GPU systems, run 1 / run 2 |
+|---:|---:|---:|---:|
+| 0 microseconds | 10.52 s | 10.48 s | 16 / 8 |
+| 5,000 microseconds | 11.04 s | 10.87 s | 120 / 128 |
+
+All four `success.txt` files were byte-identical. Zero wait was selected because
+the broker drains all already-ready request headers before flushing: full B=8
+waves still use cuDSS, but an undersized exact-pattern queue does not stall its
+workers before KLU fallback. Increasing the host registration cache from 64 to
+256 or 512 entries changed the bounded time only from 10.52 to 10.52/10.47 s,
+so the validated production setting retains 64 entries.
+
+An opt-in expected-pattern scheduler now derives initial layout classes from
+the loaded network rather than contingency names or case-specific bus ranges.
+It accounts for active parallel circuits, arbitrary N-k outage sets, islands,
+lone buses, generator-driven PV-to-PQ changes, and reference-bus transfers.
+Equal classes are dispatched in synchronized epochs whose size is the largest
+multiple of B that fits the worker pool (16 for 19 workers and B=8); original
+task IDs continue to index scientific results. Dynamic Q-limit and controller
+transitions remain guarded by the broker's exact CSR match and KLU fallback.
+
+The bounded 27-contingency IEEE-14 GPU smoke classified seven expected layouts
+into nine epochs and reported `full_batches=8`, `completed=64`, `fallbacks=29`,
+and `errors=0`. The prior input-order smoke reported five full batches, 40 GPU
+systems, and 53 fallbacks. This establishes functional batching improvement,
+not a full-case runtime result. `ScheduleByExpectedPattern` therefore remains
+disabled by default until a representative and full Texas A/B gate selects it.
+
+Power-flow assembly also retains its bus/vector/matrix mapper workspace across
+solves. It rebuilds only when an all-rank structural descriptor changes; normal
+branch outages reuse the workspace, while PV/PQ/controller structural changes
+rebuild it. Profile counters make both paths observable.
 
 ## Native Arm64 container result
 
@@ -572,12 +629,25 @@ docker run --rm [--gpus all] -v "$PWD":/work IMAGE input.xml
   -> /opt/gridpack/bin/ca.x input.xml
 ```
 
-The 7.62 GB validation image built in 47.5 seconds. Loader inspection found no
-unresolved dependencies and no startup dependency on `libcuda.so.1`, while
-retaining PETSc, KLU, and SuiteSparse. A bounded IEEE-14 run passed through
-the mounted entrypoint, passed without GPU by lazily falling back from
-non-strict cuDSS to PETSc/KLU (26 converged, one slack overload), and passed
-with strict GPU cuDSS and zero fallbacks at scaled residuals near `1e-17`.
+The final native Arm64 runtime image builds both `ca.x` and the installed
+`cudss_broker_benchmark`. Loader inspection found no unresolved dependencies;
+the runtime sees the GB10 through the NVIDIA container runtime and retains
+PETSc, KLU, and SuiteSparse for worker fallback. Its entrypoint passes `mpirun`
+through, preserving the one-argument scalar invocation while enabling the
+multi-rank broker topology without a different executable.
+
+The image includes `input_14_cudss_broker.xml` as a self-contained bounded
+B=8 smoke. Its nine-rank run analyzed 27 IEEE-14 contingencies and reported
+five full batches, 40 GPU-completed systems, 53 deliberate fallbacks, and zero
+broker errors.
+
+After the full gate selected zero wait, the two omitted-field defaults were
+also changed from 5,000 microseconds to zero and the final local tag was rebuilt
+as `sha256:6d1fef26fba340421c378c8d72aae49a206f7005f2c2339f7e6e85f64d680dbd`.
+The rebuilt image passed the same 27-contingency smoke with the same broker
+accounting. The full validation remains applicable because its XML explicitly
+set zero wait; the rebuild only made that already-tested value the omitted-field
+default.
 
 The pinned dependency image is Ubuntu 25.10 while NVIDIA's CUDA stages are
 Ubuntu 24.04. Copying the self-contained CUDA user-space runtime into the
@@ -616,22 +686,45 @@ Validation has two layers:
    classifications are pass/fail requirements; floating-point fields use
    documented tolerances.
 
-Scalar cuDSS validation will use the existing loop and result collection, so
-it cannot bypass cleanup or output work. A future wavefront executor must
-share or extract that code before changing execution order.
+The broker uses the existing contingency loop and result pipeline, so it does
+not bypass contingency restoration, classifications, statistics, or output.
+Task-indexed MPI reductions replace concurrent GA gathers for status/profile
+records and require exactly one producer for every contingency.
 
-The final golden comparison ran the seven-case Texas subset once with
-PETSc/KLU and once with strict device cuDSS. `success.txt` was byte-identical
-(including converged, divergent, islanded, slack-overload, and violation
-classifications), and the first ten profile fields were identical for every
-case: solver calls, applied updates, reported Newton iterations, and outer
-passes all matched. After normalizing signed zero, the 29.5 MB structured JSON
-was identical for all serialized bus, branch, generator, violation, and
-iteration fields. Its only difference was the difficult case's final
-tolerance, `7.440161e-9` versus `7.440072e-9`; the profile's largest
-non-divergent absolute tolerance difference was `3.89e-13`. The deliberately
-divergent trajectory ended at 1026.944 versus 1026.906 while retaining the
-same iteration count and classification.
+The final golden comparison ran the seven-case Texas subset with the selected
+B=8 configuration, eight workers, and one owner. The broker reported two full
+batches, 16 GPU-completed systems, 40 deliberate KLU fallbacks, five registered
+patterns, and zero errors. `success.txt` was byte-identical to the PETSc/KLU
+reference. Contingency identity, classifications, violation flags, solve/update
+counts, controller passes, and successful structured solutions matched; numeric
+solution fields were compared at `1e-8`, and the divergent final tolerance at
+the established `1e-4` relative tolerance. Failed/islanded/slack-overload cases
+publish no scientific solution, so historical uninitialized numeric
+placeholders are excluded while their operational fields remain exact.
+
+## Full Texas production gate
+
+The full-gate validation image
+`sha256:c2aaeadbefccba53e3d93ac5f2a6d44408ca9a36091734b2faf9eee33bc4da2d`
+ran the original 8,891-contingency Texas case with 20 launch ranks (19 workers
+and one owner), B=8, `MinimumGpuBatchSize=8`, and
+`BatchWaitMicroseconds=0`. GNU `time` around `docker run` measured 78.77 s,
+including container startup and teardown, versus the 83.05 s PETSc/KLU
+reference. This is 4.28 s (5.15%) below the required gate and 112.87 versus
+107.06 contingencies/s.
+
+The container exited zero and reported:
+
+```text
+CUDSS_BROKER_SUMMARY requests=28496 registrations=1282 full_batches=21 partial_batches=0 fallbacks=28328 errors=0 completed=168
+```
+
+The fresh `success.txt` contained exactly 8,639 successful and 252 unsuccessful
+records in task order. Its SHA-256 was
+`ed7ecb4ce0ca7506068c56eac610380f2ff2bb027242dad1b1ff9e33e1843bcb`
+and it was byte-identical to the 20-rank PETSc/KLU reference. The log contained
+one 8,891-contingency deck marker, one internally consistent broker summary,
+and no fatal cuDSS, MPI abort, or process-failure marker.
 
 ## Investigation gates
 
@@ -641,9 +734,11 @@ same iteration count and classification.
 | Optimized CPU baseline and bottleneck report | Complete |
 | Jacobian pattern study | Complete for supplied controller configuration |
 | Standalone KLU/cuDSS benchmark | Scalar lifecycle measurements complete |
-| GPU ownership alternatives report | Complete; broker is research preference |
+| GPU ownership alternatives report | Complete; one-owner MPI broker selected |
 | Multiple-power-flow-state feasibility result | Complete; current threaded design rejected by process-static data race |
-| Solver integration boundary | Optional real scalar backend implemented and tested |
-| Batch execution architecture | Deferred: current measurements do not justify implementation |
-| Result-preservation plan | Seven-case CPU/strict-cuDSS golden comparison complete |
-| Container dependency/version plan | Pinned native Arm64 image implemented and smoke-tested |
+| Solver integration boundary | Persistent scalar cache and PF executor seam implemented/tested |
+| Batch execution architecture | One-owner exact-pattern broker implemented; B=8 clears 735 and 900 gates |
+| Mapper/storage reuse | Implemented with exact structural rebuild/reuse counters |
+| Result-preservation plan | Seven-case CPU/B=8 broker golden comparison complete |
+| Container dependency/version plan | Pinned native Arm64 broker image built and bounded-smoke-tested |
+| Full Texas performance/result gate | Complete; 78.77 s, 8,639 successful, 252 unsuccessful, byte-identical to KLU |

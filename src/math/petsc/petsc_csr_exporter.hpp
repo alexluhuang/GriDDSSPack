@@ -10,6 +10,9 @@
 #include <string>
 #include <vector>
 
+#include <petscmat.h>
+#include <petscvec.h>
+
 #include "gridpack/math/matrix.hpp"
 #include "gridpack/math/vector.hpp"
 
@@ -89,6 +92,20 @@ RealCsrSystem readRealCsrSystem(const std::string& path);
  */
 RealCsrSystem extractPetscRealCsrSystem(const RealMatrix& matrix,
                                         const RealVector& rightHandSide);
+
+/**
+ * Copy a real, sequential PETSc AIJ matrix and vector into CSR.
+ *
+ * This overload lets the standalone broker benchmark exercise the identical
+ * exporter path without constructing GridPACK matrix wrappers.
+ */
+RealCsrSystem extractPetscRealCsrSystem(Mat matrix, Vec rightHandSide);
+
+/**
+ * Overwrite a real sequential PETSc vector from host double values.
+ */
+void writePetscRealVector(RealVector& destination,
+                          const std::vector<double>& values);
 
 /**
  * Export a PETSc system when diagnostic capture is enabled.

@@ -52,6 +52,43 @@ target_link_libraries(gridpack_powerflow_module
 
 
 # -------------------------------------------------------------
+# external linear-system executor test
+# -------------------------------------------------------------
+add_executable(pf_linear_system_executor_test
+  test/pf_linear_system_executor_test.cpp)
+target_link_libraries(pf_linear_system_executor_test
+  gridpack_powerflow_module
+  ${target_libraries})
+gridpack_add_serial_unit_test(pf_linear_system_executor
+  pf_linear_system_executor_test)
+
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/pf_linear_system_executor_test.xml"
+  COMMAND ${CMAKE_COMMAND} -E copy
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/pf_linear_system_executor_test.xml"
+    "${CMAKE_CURRENT_BINARY_DIR}/pf_linear_system_executor_test.xml"
+  DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/pf_linear_system_executor_test.xml"
+  )
+
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/IEEE14.raw"
+  COMMAND ${CMAKE_COMMAND} -E copy
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/IEEE14.raw"
+    "${CMAKE_CURRENT_BINARY_DIR}/IEEE14.raw"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test/IEEE14.raw"
+  )
+
+add_custom_target(pf_linear_system_executor_test_input
+  DEPENDS
+    "${CMAKE_CURRENT_BINARY_DIR}/pf_linear_system_executor_test.xml"
+    "${CMAKE_CURRENT_BINARY_DIR}/IEEE14.raw"
+  )
+add_dependencies(pf_linear_system_executor_test
+  pf_linear_system_executor_test_input)
+
+
+# -------------------------------------------------------------
 # component serialization tests
 # -------------------------------------------------------------
 # target_link_libraries(gridpack_powerflow_module ${target_libraries})

@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <string>
 
 #include "gridpack/math/matrix.hpp"
@@ -145,6 +146,48 @@ BOOST_AUTO_TEST_CASE(extractAndRoundTrip)
       expectedHeader, expectedHeader + sizeof(expectedHeader));
 }
 
+BOOST_AUTO_TEST_CASE(rejectNonFiniteMatrixValueDuringExtraction)
+{
+  gridpack::parallel::Communicator world;
+  BOOST_REQUIRE_EQUAL(world.size(), 1);
+
+  gridpack::math::RealMatrix matrix(
+      world, 1, 1, gridpack::math::Sparse);
+  matrix.setElement(
+      0, 0, std::numeric_limits<double>::quiet_NaN());
+  matrix.ready();
+
+  gridpack::math::RealVector rightHandSide(world, 1);
+  rightHandSide.setElement(0, 1.0);
+  rightHandSide.ready();
+
+  BOOST_CHECK_THROW(
+      gridpack::math::extractPetscRealCsrSystem(
+          matrix, rightHandSide),
+      gridpack::Exception);
+}
+
+BOOST_AUTO_TEST_CASE(rejectNonFiniteRightHandSideDuringExtraction)
+{
+  gridpack::parallel::Communicator world;
+  BOOST_REQUIRE_EQUAL(world.size(), 1);
+
+  gridpack::math::RealMatrix matrix(
+      world, 1, 1, gridpack::math::Sparse);
+  matrix.setElement(0, 0, 1.0);
+  matrix.ready();
+
+  gridpack::math::RealVector rightHandSide(world, 1);
+  rightHandSide.setElement(
+      0, std::numeric_limits<double>::infinity());
+  rightHandSide.ready();
+
+  BOOST_CHECK_THROW(
+      gridpack::math::extractPetscRealCsrSystem(
+          matrix, rightHandSide),
+      gridpack::Exception);
+}
+
 BOOST_AUTO_TEST_CASE(rejectTrailingData)
 {
   gridpack::math::RealCsrSystem system;
@@ -191,6 +234,28 @@ BOOST_AUTO_TEST_CASE(rejectHugeHeaderWithShortPayload)
 
   BOOST_CHECK_THROW(
       gridpack::math::readRealCsrSystem(file.path()),
+      gridpack::Exception);
+}
+
+BOOST_AUTO_TEST_CASE(writeSequentialRealVector)
+{
+  gridpack::parallel::Communicator world;
+  BOOST_REQUIRE_EQUAL(world.size(), 1);
+
+  gridpack::math::RealVector destination(world, 3);
+  destination.fill(0.0);
+  destination.ready();
+  const std::vector<double> values = {1.25, -2.5, 3.75};
+  gridpack::math::writePetscRealVector(destination, values);
+
+  for (int index = 0; index < 3; ++index) {
+    double value = 0.0;
+    destination.getElement(index, value);
+    BOOST_CHECK_EQUAL(value, values[static_cast<std::size_t>(index)]);
+  }
+  const std::vector<double> wrongSize = {1.0, 2.0};
+  BOOST_CHECK_THROW(
+      gridpack::math::writePetscRealVector(destination, wrongSize),
       gridpack::Exception);
 }
 

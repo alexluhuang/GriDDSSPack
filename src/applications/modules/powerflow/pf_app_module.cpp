@@ -55,8 +55,143 @@
 #include "gridpack/utilities/string_utils.hpp"
 #include <algorithm>
 #include <fstream>
+#include <limits>
 
 #define USE_REAL_VALUES
+
+namespace gridpack {
+namespace powerflow {
+
+class PFMapperWorkspace
+{
+  public:
+    boost::shared_ptr<gridpack::mapper::BusVectorMap<PFNetwork> > vectorMapper;
+    boost::shared_ptr<gridpack::mapper::FullMatrixMap<PFNetwork> > jacobianMapper;
+    boost::shared_ptr<gridpack::math::RealVector> rightHandSide;
+    boost::shared_ptr<gridpack::math::RealVector> correction;
+    boost::shared_ptr<gridpack::math::RealMatrix> jacobian;
+    std::vector<int> vectorSignature;
+    std::vector<int> jacobianSignature;
+};
+
+namespace {
+
+enum MapperSignatureKind {
+  VectorMapperSignature = 1,
+  JacobianMapperSignature = 2
+};
+
+void appendSize(std::vector<int>& signature, bool contributes,
+    int firstSize, int secondSize)
+{
+  signature.push_back(contributes ? 1 : 0);
+  signature.push_back(contributes ? firstSize : 0);
+  signature.push_back(contributes ? secondSize : 0);
+}
+
+/**
+ * Collect the complete contribution descriptor used by the mapper. This is
+ * deliberately an exact descriptor rather than a hash: equal descriptors
+ * guarantee that every cached component offset and distributed block size is
+ * still valid, while any controller/topology transition rebuilds collectively.
+ */
+std::vector<int> collectMapperSignature(
+    const boost::shared_ptr<PFNetwork>& network,
+    const gridpack::parallel::Communicator& communicator,
+    MapperSignatureKind kind)
+{
+  std::vector<int> local;
+  const int numBuses = network->numBuses();
+  const int numBranches = network->numBranches();
+  local.reserve(kind == VectorMapperSignature
+      ? 3 + 6 * numBuses
+      : 4 + 6 * numBuses + 9 * numBranches);
+  local.push_back(1); // Signature format version.
+  local.push_back(static_cast<int>(kind));
+  local.push_back(numBuses);
+
+  for (int i = 0; i < numBuses; ++i) {
+    boost::shared_ptr<gridpack::component::BaseBusComponent> bus =
+      network->getBus(i);
+    const bool active = network->getActiveBus(i);
+    int matrixVectorIndex = -1;
+    bus->getMatVecIndex(&matrixVectorIndex);
+    local.push_back(i);
+    local.push_back(active ? 1 : 0);
+    local.push_back(matrixVectorIndex);
+
+    if (kind == VectorMapperSignature) {
+      int size = 0;
+      const bool contributes = active && bus->vectorSize(&size);
+      appendSize(local, contributes, size, 0);
+    } else {
+      int rows = 0;
+      int columns = 0;
+      const bool contributes = bus->matrixDiagSize(&rows, &columns);
+      appendSize(local, contributes, rows, columns);
+    }
+  }
+
+  if (kind == JacobianMapperSignature) {
+    local.push_back(numBranches);
+    for (int i = 0; i < numBranches; ++i) {
+      boost::shared_ptr<gridpack::component::BaseBranchComponent> branch =
+        network->getBranch(i);
+      int firstIndex = -1;
+      int secondIndex = -1;
+      branch->getMatVecIndices(&firstIndex, &secondIndex);
+      local.push_back(i);
+      local.push_back(firstIndex);
+      local.push_back(secondIndex);
+
+      int rows = 0;
+      int columns = 0;
+      bool contributes = branch->matrixForwardSize(&rows, &columns);
+      appendSize(local, contributes, rows, columns);
+      rows = 0;
+      columns = 0;
+      contributes = branch->matrixReverseSize(&rows, &columns);
+      appendSize(local, contributes, rows, columns);
+    }
+  }
+
+  if (local.size() >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw gridpack::Exception(
+        "Powerflow local mapper structural signature exceeds MPI limits");
+  }
+  const int processCount = communicator.size();
+  const int localCount = static_cast<int>(local.size());
+  std::vector<int> counts(processCount, 0);
+  MPI_Allgather(&localCount, 1, MPI_INT, &counts[0], 1, MPI_INT,
+      static_cast<MPI_Comm>(communicator));
+
+  std::vector<int> displacements(processCount, 0);
+  size_t totalCount = 0;
+  for (int i = 0; i < processCount; ++i) {
+    if (counts[i] < 0 ||
+        totalCount > static_cast<size_t>(std::numeric_limits<int>::max()) -
+          static_cast<size_t>(counts[i])) {
+      throw gridpack::Exception(
+          "Powerflow mapper structural signature exceeds MPI limits");
+    }
+    displacements[i] = static_cast<int>(totalCount);
+    totalCount += static_cast<size_t>(counts[i]);
+  }
+
+  // Prefixing the gathered descriptors with their per-rank lengths preserves
+  // exact process boundaries, including ranks with no local components.
+  std::vector<int> result(counts);
+  result.resize(counts.size() + totalCount);
+  MPI_Allgatherv(local.empty() ? NULL : &local[0], localCount, MPI_INT,
+      totalCount == 0 ? NULL : &result[counts.size()], &counts[0],
+      &displacements[0], MPI_INT, static_cast<MPI_Comm>(communicator));
+  return result;
+}
+
+} // anonymous namespace
+} // namespace powerflow
+} // namespace gridpack
 
 /**
  * Basic constructor
@@ -65,6 +200,7 @@ gridpack::powerflow::PFAppModule::PFAppModule(void)
 {
   p_no_print = false;
   p_solveMetrics = PFSolveMetrics();
+  p_linearSystemExecutor = NULL;
 }
 
 /**
@@ -72,6 +208,12 @@ gridpack::powerflow::PFAppModule::PFAppModule(void)
  */
 gridpack::powerflow::PFAppModule::~PFAppModule(void)
 {
+}
+
+void gridpack::powerflow::PFAppModule::setLinearSystemExecutor(
+    PFLinearSystemExecutor *executor)
+{
+  p_linearSystemExecutor = executor;
 }
 
 enum Parser{PTI23, PTI33, PTI34, PTI35, PTI36, MAT_POWER, GOSS};
@@ -89,6 +231,9 @@ void gridpack::powerflow::PFAppModule::readNetwork(
     boost::shared_ptr<PFNetwork> &network,
     gridpack::utility::Configuration *config, int idx)
 {
+  // A workspace contains direct component pointers and must never cross a
+  // network replacement, even when the replacement has the same structure.
+  p_mapperWorkspace.reset();
   p_network = network;
   p_comm = network->communicator();
   p_config = config;
@@ -515,15 +660,43 @@ bool gridpack::powerflow::PFAppModule::solve()
     // Set PQ
     timer->start(t_cmap);
     p_factory->setMode(RHS);
-    gridpack::mapper::BusVectorMap<PFNetwork> vMap(p_network);
+    if (!p_mapperWorkspace) {
+      p_mapperWorkspace.reset(new PFMapperWorkspace());
+    }
+    std::vector<int> vectorSignature = collectMapperSignature(
+        p_network, p_comm, VectorMapperSignature);
+    const bool rebuildVectorWorkspace =
+      !p_mapperWorkspace->vectorMapper ||
+      !p_mapperWorkspace->rightHandSide ||
+      !p_mapperWorkspace->correction ||
+      p_mapperWorkspace->vectorSignature != vectorSignature;
+    if (rebuildVectorWorkspace) {
+      p_mapperWorkspace->correction.reset();
+      p_mapperWorkspace->rightHandSide.reset();
+      p_mapperWorkspace->vectorMapper.reset();
+      p_mapperWorkspace->vectorMapper.reset(
+          new gridpack::mapper::BusVectorMap<PFNetwork>(p_network));
+      p_mapperWorkspace->vectorSignature.swap(vectorSignature);
+    }
     timer->stop(t_cmap);
     int t_vmap = timer->createCategory("Powerflow: Map to Vector");
     timer->start(t_vmap);
 
 #ifdef USE_REAL_VALUES
-    boost::shared_ptr<gridpack::math::RealVector> PQ = vMap.mapToRealVector();
+    if (rebuildVectorWorkspace) {
+      p_mapperWorkspace->rightHandSide =
+        p_mapperWorkspace->vectorMapper->mapToRealVector();
+      p_mapperWorkspace->correction.reset(
+          p_mapperWorkspace->rightHandSide->clone());
+    } else {
+      p_mapperWorkspace->vectorMapper->mapToRealVector(
+          p_mapperWorkspace->rightHandSide);
+    }
+    boost::shared_ptr<gridpack::math::RealVector> PQ =
+      p_mapperWorkspace->rightHandSide;
 #else
-    boost::shared_ptr<gridpack::math::Vector> PQ = vMap.mapToVector();
+    boost::shared_ptr<gridpack::math::Vector> PQ =
+      p_mapperWorkspace->vectorMapper->mapToVector();
 #endif
     timer->stop(t_vmap);
     gridpack::ComplexType tol_org = PQ->normInfinity();
@@ -544,20 +717,47 @@ bool gridpack::powerflow::PFAppModule::solve()
 
     timer->start(t_cmap);
     p_factory->setMode(Jacobian);
-    gridpack::mapper::FullMatrixMap<PFNetwork> jMap(p_network);
+    std::vector<int> jacobianSignature = collectMapperSignature(
+        p_network, p_comm, JacobianMapperSignature);
+    const bool rebuildJacobianWorkspace =
+      !p_mapperWorkspace->jacobianMapper ||
+      !p_mapperWorkspace->jacobian ||
+      p_mapperWorkspace->jacobianSignature != jacobianSignature;
+    if (rebuildJacobianWorkspace) {
+      p_mapperWorkspace->jacobian.reset();
+      p_mapperWorkspace->jacobianMapper.reset();
+      p_mapperWorkspace->jacobianMapper.reset(
+          new gridpack::mapper::FullMatrixMap<PFNetwork>(p_network));
+      p_mapperWorkspace->jacobianSignature.swap(jacobianSignature);
+    }
+    if (rebuildVectorWorkspace || rebuildJacobianWorkspace) {
+      p_solveMetrics.mapperWorkspaceRebuilds++;
+    } else {
+      p_solveMetrics.mapperWorkspaceReuses++;
+    }
     timer->stop(t_cmap);
     timer->start(t_mmap);
 
 #ifdef USE_REAL_VALUES
-    boost::shared_ptr<gridpack::math::RealMatrix> J = jMap.mapToRealMatrix();
+    if (rebuildJacobianWorkspace) {
+      p_mapperWorkspace->jacobian =
+        p_mapperWorkspace->jacobianMapper->mapToRealMatrix();
+    } else {
+      p_mapperWorkspace->jacobianMapper->mapToRealMatrix(
+          p_mapperWorkspace->jacobian);
+    }
+    boost::shared_ptr<gridpack::math::RealMatrix> J =
+      p_mapperWorkspace->jacobian;
 #else
-    boost::shared_ptr<gridpack::math::Matrix> J = jMap.mapToMatrix();
+    boost::shared_ptr<gridpack::math::Matrix> J =
+      p_mapperWorkspace->jacobianMapper->mapToMatrix();
 #endif
     timer->stop(t_mmap);
 
     // Create X vector by cloning PQ
 #ifdef USE_REAL_VALUES
-    boost::shared_ptr<gridpack::math::RealVector> X(PQ->clone());
+    boost::shared_ptr<gridpack::math::RealVector> X =
+      p_mapperWorkspace->correction;
 #else
     boost::shared_ptr<gridpack::math::Vector> X(PQ->clone());
 #endif
@@ -568,16 +768,22 @@ bool gridpack::powerflow::PFAppModule::solve()
     int t_csolv = timer->createCategory("Powerflow: Create Linear Solver");
     timer->start(t_csolv);
 #ifdef USE_REAL_VALUES
-    gridpack::math::RealLinearSolver solver(*J);
+    boost::scoped_ptr<gridpack::math::RealLinearSolver> solver;
+    if (p_linearSystemExecutor == NULL) {
+      solver.reset(new gridpack::math::RealLinearSolver(*J));
+    }
 #else
-    gridpack::math::LinearSolver solver(*J);
+    boost::scoped_ptr<gridpack::math::LinearSolver> solver(
+        new gridpack::math::LinearSolver(*J));
 #endif
-    try {
-      solver.configure(cursor);
-    } catch (...) {
-      timer->stop(t_csolv);
-      timer->stop(t_total);
-      throw;
+    if (solver) {
+      try {
+        solver->configure(cursor);
+      } catch (...) {
+        timer->stop(t_csolv);
+        timer->stop(t_total);
+        throw;
+      }
     }
     timer->stop(t_csolv);
 
@@ -609,10 +815,44 @@ bool gridpack::powerflow::PFAppModule::solve()
     }
 #endif
     timer->start(t_lsolv);
+    bool invokingLinearSystemExecutor = false;
     try {
       p_solveMetrics.linearSolveCalls++;
-      solver.solve(*PQ, *X);
-    } catch (const gridpack::Exception e) {
+#ifdef USE_REAL_VALUES
+      if (p_linearSystemExecutor != NULL) {
+        PFLinearSystem system = {
+          *J, *PQ, *X, csrContext.caseName, csrContext.baseCase,
+          ai_iter, ctrl_iter, 1, p_solveMetrics.linearSolveCalls
+        };
+        invokingLinearSystemExecutor = true;
+        const bool handled = p_linearSystemExecutor->solve(system);
+        invokingLinearSystemExecutor = false;
+        if (!handled) {
+          if (!solver) {
+            timer->start(t_csolv);
+            try {
+              solver.reset(new gridpack::math::RealLinearSolver(*J));
+              solver->configure(cursor);
+            } catch (...) {
+              timer->stop(t_csolv);
+              throw;
+            }
+            timer->stop(t_csolv);
+          }
+          solver->solve(*PQ, *X);
+        }
+      } else {
+        solver->solve(*PQ, *X);
+      }
+#else
+      solver->solve(*PQ, *X);
+#endif
+    } catch (const std::exception& e) {
+      if (invokingLinearSystemExecutor) {
+        timer->stop(t_lsolv);
+        timer->stop(t_total);
+        throw;
+      }
       std::string w(e.what());
       if (!p_no_print) {
         sprintf(ioBuf,"p[%d] hit exception: %s\n",
@@ -647,7 +887,7 @@ bool gridpack::powerflow::PFAppModule::solve()
       // Push current values in X vector back into network components
       timer->start(t_bmap);
       p_factory->setMode(RHS);
-      vMap.mapToBus(X);
+      p_mapperWorkspace->vectorMapper->mapToBus(X);
       timer->stop(t_bmap);
 
       // Exchange data between ghost buses
@@ -659,17 +899,17 @@ bool gridpack::powerflow::PFAppModule::solve()
       // Create new versions of Jacobian and PQ vector
       timer->start(t_vmap);
 #ifdef USE_REAL_VALUES
-      vMap.mapToRealVector(PQ);
+      p_mapperWorkspace->vectorMapper->mapToRealVector(PQ);
 #else
-      vMap.mapToVector(PQ);
+      p_mapperWorkspace->vectorMapper->mapToVector(PQ);
 #endif
       timer->stop(t_vmap);
       timer->start(t_mmap);
       p_factory->setMode(Jacobian);
 #ifdef USE_REAL_VALUES
-      jMap.mapToRealMatrix(J);
+      p_mapperWorkspace->jacobianMapper->mapToRealMatrix(J);
 #else
-      jMap.mapToMatrix(J);
+      p_mapperWorkspace->jacobianMapper->mapToMatrix(J);
 #endif
       timer->stop(t_mmap);
 
@@ -687,10 +927,44 @@ bool gridpack::powerflow::PFAppModule::solve()
       }
 #endif
       timer->start(t_lsolv);
+      bool invokingLinearSystemExecutor = false;
       try {
         p_solveMetrics.linearSolveCalls++;
-        solver.solve(*PQ, *X);
-      } catch (const gridpack::Exception e) {
+#ifdef USE_REAL_VALUES
+        if (p_linearSystemExecutor != NULL) {
+          PFLinearSystem system = {
+            *J, *PQ, *X, csrContext.caseName, csrContext.baseCase,
+            ai_iter, ctrl_iter, iter + 2, p_solveMetrics.linearSolveCalls
+          };
+          invokingLinearSystemExecutor = true;
+          const bool handled = p_linearSystemExecutor->solve(system);
+          invokingLinearSystemExecutor = false;
+          if (!handled) {
+            if (!solver) {
+              timer->start(t_csolv);
+              try {
+                solver.reset(new gridpack::math::RealLinearSolver(*J));
+                solver->configure(cursor);
+              } catch (...) {
+                timer->stop(t_csolv);
+                throw;
+              }
+              timer->stop(t_csolv);
+            }
+            solver->solve(*PQ, *X);
+          }
+        } else {
+          solver->solve(*PQ, *X);
+        }
+#else
+        solver->solve(*PQ, *X);
+#endif
+      } catch (const std::exception& e) {
+        if (invokingLinearSystemExecutor) {
+          timer->stop(t_lsolv);
+          timer->stop(t_total);
+          throw;
+        }
         std::string w(e.what());
         if (!p_no_print) {
           sprintf(ioBuf,"p[%d] hit exception: %s\n",
@@ -918,13 +1192,12 @@ bool gridpack::powerflow::PFAppModule::solve()
     timer->stop(t_controller);
 
     // Push final result back onto buses, but ONLY if no controller changes.
-    // If qlim changed PV->PQ, vMap dimensions are stale — a new iteration
-    // will start with a fresh vMap. Shunt changes are safe (same dimensions)
-    // but we re-solve anyway for consistency.
+    // A controller-induced structural change is detected at the next pass and
+    // rebuilds the cached mapper workspace before it can be used again.
     if (!ctrl_repeat) {
       timer->start(t_bmap);
       p_factory->setMode(RHS);
-      vMap.mapToBus(X);
+      p_mapperWorkspace->vectorMapper->mapToBus(X);
       timer->stop(t_bmap);
 
       timer->start(t_updt);

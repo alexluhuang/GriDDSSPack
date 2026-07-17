@@ -841,9 +841,8 @@ RealCsrSystem readRealCsrSystem(const std::string& path)
   return system;
 }
 
-RealCsrSystem extractPetscRealCsrSystem(
-    const RealMatrix& matrix,
-    const RealVector& rightHandSide)
+RealCsrSystem extractPetscRealCsrSystem(Mat petscMatrix,
+                                       Vec petscVector)
 {
 #if defined(PETSC_USE_COMPLEX)
   fail("complex PETSc scalar builds are not supported");
@@ -857,9 +856,6 @@ RealCsrSystem extractPetscRealCsrSystem(
           std::numeric_limits<PetscInt>::is_signed &&
           std::numeric_limits<PetscInt>::digits == 31,
           "PETSc must use signed 32-bit indices");
-
-  Mat petscMatrix = *PETScMatrix(matrix);
-  Vec petscVector = *PETScVector(rightHandSide);
 
   MatType matrixType = NULL;
   checkPetsc(MatGetType(petscMatrix, &matrixType));
@@ -943,19 +939,82 @@ RealCsrSystem extractPetscRealCsrSystem(
             "PETSc CSR column index is outside matrix bounds");
     system.columnIndices[static_cast<std::size_t>(entry)] =
       static_cast<std::uint32_t>(column);
-    system.values[static_cast<std::size_t>(entry)] =
+    const double value =
       static_cast<double>(matrixValues.values()[entry]);
+    require(std::isfinite(value),
+            "matrix contains a non-finite value");
+    system.values[static_cast<std::size_t>(entry)] = value;
   }
   for (PetscInt row = 0; row < rows; ++row) {
-    system.rightHandSides[static_cast<std::size_t>(row)] =
+    const double value =
       static_cast<double>(vectorValues.values()[row]);
+    require(std::isfinite(value),
+            "right-hand side contains a non-finite value");
+    system.rightHandSides[static_cast<std::size_t>(row)] = value;
   }
 
   vectorValues.restore();
   matrixValues.restore();
   rowView.restore();
-  validateSystem(system);
+  // Assembled MATSEQAIJ owns a canonical, sorted CSR structure. The bounds
+  // checks above protect the narrowing copies; repeating the file-input
+  // validator here would rescan every index and numeric value on every Newton
+  // solve. Protocol registration validates the copied exact structure before
+  // cuDSS sees it.
   return system;
+#endif
+}
+
+RealCsrSystem extractPetscRealCsrSystem(
+    const RealMatrix& matrix,
+    const RealVector& rightHandSide)
+{
+  return extractPetscRealCsrSystem(
+      *PETScMatrix(matrix), *PETScVector(rightHandSide));
+}
+
+void writePetscRealVector(RealVector& destination,
+                          const std::vector<double>& values)
+{
+#if defined(PETSC_USE_COMPLEX)
+  fail("complex PETSc scalar builds are not supported");
+#else
+  require(sizeof(PetscScalar) == sizeof(double) &&
+          std::numeric_limits<PetscScalar>::is_iec559,
+          "PETSc scalar type must be IEEE-754 binary64");
+  Vec vector = *PETScVector(destination);
+  VecType vectorType = NULL;
+  checkPetsc(VecGetType(vector, &vectorType));
+  require(vectorType != NULL && std::strcmp(vectorType, VECSEQ) == 0,
+          "destination must have exact PETSc type VECSEQ");
+
+  MPI_Comm communicator = MPI_COMM_NULL;
+  checkPetsc(PetscObjectGetComm(
+      reinterpret_cast<PetscObject>(vector), &communicator));
+  int processes = 0;
+  require(MPI_Comm_size(communicator, &processes) == MPI_SUCCESS &&
+          processes == 1,
+          "destination communicator must contain exactly one process");
+
+  PetscInt size = 0;
+  PetscInt localSize = 0;
+  checkPetsc(VecGetSize(vector, &size));
+  checkPetsc(VecGetLocalSize(vector, &localSize));
+  require(size >= 0 && localSize == size &&
+          static_cast<std::size_t>(size) == values.size(),
+          "destination size is inconsistent with host values");
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    require(std::isfinite(values[index]),
+            "host solution contains a non-finite value");
+  }
+
+  PetscScalar *destinationValues = NULL;
+  checkPetsc(VecGetArray(vector, &destinationValues));
+  for (PetscInt index = 0; index < size; ++index) {
+    destinationValues[index] =
+      static_cast<PetscScalar>(values[static_cast<std::size_t>(index)]);
+  }
+  checkPetsc(VecRestoreArray(vector, &destinationValues));
 #endif
 }
 

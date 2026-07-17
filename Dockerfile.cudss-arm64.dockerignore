@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.agents
+.codex
+build
+docs
+external_dependencies
+python
+tools
+Dockerfile
+README.md
+install_gridpack.sh
+install_gridpack_deps.sh

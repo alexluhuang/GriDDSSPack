@@ -26,12 +26,22 @@
 
 #include "gridpack/include/gridpack.hpp"
 #include "gridpack/applications/modules/powerflow/pf_app_module.hpp"
+#include "gridpack/math/cudss/cudss_mpi_broker.hpp"
+#include "gridpack/math/petsc/petsc_csr_exporter.hpp"
 #include "gridpack/utilities/results_exporter.hpp"
 #include "ca_driver.hpp"
+#include "ca_pattern_scheduler.hpp"
+
+#include <ga.h>
 
 #include <boost/scoped_ptr.hpp>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <set>
 #include <sstream>
 
 #define USE_SUCCESS
@@ -58,8 +68,194 @@ struct CAProfileRecord
   int reportedNewtonIterations;
   int controllerLoopPasses;
   int areaInterchangePasses;
+  int mapperWorkspaceRebuilds;
+  int mapperWorkspaceReuses;
   double finalTolerance;
 };
+
+class CAContingencyTaskDispatcher
+{
+  public:
+    CAContingencyTaskDispatcher(
+        gridpack::parallel::TaskManager& manager,
+        const std::vector<
+          gridpack::contingency_analysis::PatternScheduleEpoch>& epochs)
+      : p_manager(manager), p_epochs(epochs), p_epoch(0), p_epochStarted(false)
+    {}
+
+    bool nextTask(gridpack::parallel::Communicator& communicator, int *task)
+    {
+      while (p_epoch < p_epochs.size()) {
+        if (!p_epochStarted) {
+          p_manager.set(static_cast<int>(p_epochs[p_epoch].taskIds.size()));
+          p_epochStarted = true;
+        }
+        int epochTask;
+        if (p_manager.nextTask(communicator, &epochTask)) {
+          *task = p_epochs[p_epoch].taskIds[epochTask];
+          return true;
+        }
+        ++p_epoch;
+        p_epochStarted = false;
+      }
+      *task = -1;
+      return false;
+    }
+
+  private:
+    gridpack::parallel::TaskManager& p_manager;
+    const std::vector<
+      gridpack::contingency_analysis::PatternScheduleEpoch>& p_epochs;
+    std::size_t p_epoch;
+    bool p_epochStarted;
+};
+
+std::vector<CAProfileRecord> gatherProfileRecords(
+    const gridpack::parallel::Communicator& communicator,
+    const std::vector<int>& localIndices,
+    const std::vector<CAProfileRecord>& localRecords,
+    int taskCount)
+{
+  const std::size_t integerFields = 9;
+  if (taskCount < 0 || localIndices.size() != localRecords.size() ||
+      static_cast<std::size_t>(taskCount) >
+        static_cast<std::size_t>(std::numeric_limits<int>::max()) /
+          integerFields) {
+    throw gridpack::Exception("invalid contingency profile dimensions");
+  }
+
+  const std::size_t tasks = static_cast<std::size_t>(taskCount);
+  std::vector<int> presence(tasks, 0);
+  std::vector<int> fields(tasks * integerFields, 0);
+  std::vector<double> tolerances(tasks, 0.0);
+  for (std::size_t local = 0; local < localIndices.size(); ++local) {
+    const int task = localIndices[local];
+    if (task < 0 || task >= taskCount) {
+      throw gridpack::Exception("contingency profile task is out of range");
+    }
+    const std::size_t index = static_cast<std::size_t>(task);
+    const CAProfileRecord& record = localRecords[local];
+    ++presence[index];
+    int *destination = &fields[index * integerFields];
+    destination[0] = record.status;
+    destination[1] = record.powerFlowSolveCalls;
+    destination[2] = record.linearSolveCalls;
+    destination[3] = record.completedNewtonUpdates;
+    destination[4] = record.reportedNewtonIterations;
+    destination[5] = record.controllerLoopPasses;
+    destination[6] = record.areaInterchangePasses;
+    destination[7] = record.mapperWorkspaceRebuilds;
+    destination[8] = record.mapperWorkspaceReuses;
+    tolerances[index] = record.finalTolerance;
+  }
+
+  MPI_Comm mpiCommunicator = static_cast<MPI_Comm>(communicator);
+  const int taskElements = taskCount;
+  const int fieldElements = static_cast<int>(fields.size());
+  int presenceError = MPI_SUCCESS;
+  int toleranceError = MPI_SUCCESS;
+  int fieldError = MPI_SUCCESS;
+  if (taskElements > 0) {
+    presenceError = MPI_Allreduce(MPI_IN_PLACE, presence.data(), taskElements,
+                                  MPI_INT, MPI_SUM, mpiCommunicator);
+    toleranceError = MPI_Allreduce(MPI_IN_PLACE, tolerances.data(),
+                                   taskElements, MPI_DOUBLE, MPI_SUM,
+                                   mpiCommunicator);
+  }
+  if (fieldElements > 0) {
+    fieldError = MPI_Allreduce(MPI_IN_PLACE, fields.data(), fieldElements,
+                               MPI_INT, MPI_SUM, mpiCommunicator);
+  }
+  if (presenceError != MPI_SUCCESS || toleranceError != MPI_SUCCESS ||
+      fieldError != MPI_SUCCESS) {
+    throw gridpack::Exception("unable to gather contingency profile records");
+  }
+
+  std::vector<CAProfileRecord> result(tasks);
+  for (std::size_t index = 0; index < tasks; ++index) {
+    if (presence[index] != 1) {
+      throw gridpack::Exception(
+          "contingency profile task was not produced exactly once");
+    }
+    const int *source = &fields[index * integerFields];
+    result[index].status = source[0];
+    result[index].powerFlowSolveCalls = source[1];
+    result[index].linearSolveCalls = source[2];
+    result[index].completedNewtonUpdates = source[3];
+    result[index].reportedNewtonIterations = source[4];
+    result[index].controllerLoopPasses = source[5];
+    result[index].areaInterchangePasses = source[6];
+    result[index].mapperWorkspaceRebuilds = source[7];
+    result[index].mapperWorkspaceReuses = source[8];
+    result[index].finalTolerance = tolerances[index];
+  }
+  return result;
+}
+
+void gatherContingencyStatus(
+    const gridpack::parallel::Communicator& communicator,
+    const std::vector<int>& localIndices,
+    std::vector<bool>& success,
+    std::vector<int>& violation,
+    std::vector<bool>& isolated,
+    int taskCount)
+{
+  if (taskCount < 0 || localIndices.size() != success.size() ||
+      localIndices.size() != violation.size() ||
+      localIndices.size() != isolated.size()) {
+    throw gridpack::Exception("invalid contingency status dimensions");
+  }
+  const std::size_t tasks = static_cast<std::size_t>(taskCount);
+  std::vector<int> presence(tasks, 0);
+  std::vector<int> successValues(tasks, 0);
+  std::vector<int> violationValues(tasks, 0);
+  std::vector<int> isolatedValues(tasks, 0);
+  for (std::size_t local = 0; local < localIndices.size(); ++local) {
+    const int task = localIndices[local];
+    if (task < 0 || task >= taskCount) {
+      throw gridpack::Exception("contingency status task is out of range");
+    }
+    const std::size_t index = static_cast<std::size_t>(task);
+    ++presence[index];
+    successValues[index] = success[local] ? 1 : 0;
+    violationValues[index] = violation[local];
+    isolatedValues[index] = isolated[local] ? 1 : 0;
+  }
+
+  MPI_Comm mpiCommunicator = static_cast<MPI_Comm>(communicator);
+  int errors[4] = {MPI_SUCCESS, MPI_SUCCESS, MPI_SUCCESS, MPI_SUCCESS};
+  if (taskCount > 0) {
+    errors[0] = MPI_Allreduce(MPI_IN_PLACE, presence.data(), taskCount,
+                              MPI_INT, MPI_SUM, mpiCommunicator);
+    errors[1] = MPI_Allreduce(MPI_IN_PLACE, successValues.data(), taskCount,
+                              MPI_INT, MPI_SUM, mpiCommunicator);
+    errors[2] = MPI_Allreduce(MPI_IN_PLACE, violationValues.data(), taskCount,
+                              MPI_INT, MPI_SUM, mpiCommunicator);
+    errors[3] = MPI_Allreduce(MPI_IN_PLACE, isolatedValues.data(), taskCount,
+                              MPI_INT, MPI_SUM, mpiCommunicator);
+  }
+  for (std::size_t index = 0; index < 4; ++index) {
+    if (errors[index] != MPI_SUCCESS) {
+      throw gridpack::Exception("unable to gather contingency status");
+    }
+  }
+
+  success.assign(tasks, false);
+  violation.assign(tasks, 0);
+  isolated.assign(tasks, false);
+  for (std::size_t index = 0; index < tasks; ++index) {
+    if (presence[index] != 1 ||
+        (successValues[index] != 0 && successValues[index] != 1) ||
+        violationValues[index] < 0 || violationValues[index] > 4 ||
+        (isolatedValues[index] != 0 && isolatedValues[index] != 1)) {
+      throw gridpack::Exception(
+          "contingency status task was not produced exactly once");
+    }
+    success[index] = successValues[index] != 0;
+    violation[index] = violationValues[index];
+    isolated[index] = isolatedValues[index] != 0;
+  }
+}
 
 void accumulateSolveMetrics(
     CAProfileRecord& record,
@@ -72,6 +268,8 @@ void accumulateSolveMetrics(
   record.reportedNewtonIterations += convergence.iterations;
   record.controllerLoopPasses += metrics.controllerLoopPasses;
   record.areaInterchangePasses += metrics.areaInterchangePasses;
+  record.mapperWorkspaceRebuilds += metrics.mapperWorkspaceRebuilds;
+  record.mapperWorkspaceReuses += metrics.mapperWorkspaceReuses;
   record.finalTolerance = convergence.finalTolerance;
 }
 
@@ -104,6 +302,167 @@ std::string csvField(const std::string& value)
   result += '"';
   return result;
 }
+
+std::string lowerCase(std::string value)
+{
+  for (std::string::iterator iter = value.begin(); iter != value.end(); ++iter) {
+    *iter = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(*iter)));
+  }
+  return value;
+}
+
+void brokerDiagnostic(bool enabled, int rank, const char *stage)
+{
+  if (enabled) {
+    std::cerr << "p[" << rank << "] CUDSSBroker: " << stage << std::endl;
+  }
+}
+
+void requireKluFallback(gridpack::utility::Configuration *configuration)
+{
+  gridpack::utility::Configuration::CursorPtr powerflow =
+    configuration->getCursor("Configuration.Powerflow");
+  gridpack::utility::Configuration::CursorPtr solver;
+  if (powerflow) solver = powerflow->getCursor("LinearSolver");
+
+  std::string backend("petsc");
+  std::string petscOptions;
+  if (solver) {
+    backend = solver->get("Backend", backend);
+    solver->get("PETScOptions", &petscOptions);
+  }
+  const char *environment =
+    std::getenv("GRIDPACK_LINEAR_SOLVER_BACKEND");
+  if (environment != NULL && *environment != '\0') backend = environment;
+  if (lowerCase(backend) != "petsc") {
+    throw gridpack::Exception(
+        "CUDSSBroker requires Powerflow.LinearSolver Backend=petsc so "
+        "fallback never launches scalar cuDSS on worker ranks");
+  }
+  if (lowerCase(petscOptions).find("klu") == std::string::npos) {
+    throw gridpack::Exception(
+        "CUDSSBroker requires KLU in Powerflow.LinearSolver.PETScOptions");
+  }
+}
+
+class CABrokerLinearSystemExecutor
+  : public gridpack::powerflow::PFLinearSystemExecutor
+{
+  public:
+    CABrokerLinearSystemExecutor(
+        gridpack::math::CUDSSBrokerClient& client,
+        MPI_Comm communicator, bool strict)
+      : p_client(client), p_communicator(communicator), p_strict(strict),
+        p_taskId(std::numeric_limits<std::uint64_t>::max())
+    {}
+
+    void taskId(std::uint64_t value)
+    {
+      p_taskId = value;
+    }
+
+    bool solve(gridpack::powerflow::PFLinearSystem& system)
+    {
+      gridpack::math::RealCsrSystem csr;
+      try {
+        csr = gridpack::math::extractPetscRealCsrSystem(
+            system.matrix, system.rightHandSide);
+      } catch (const std::exception& error) {
+        if (!p_strict) return false;
+        abort(error.what());
+      }
+
+      try {
+        std::vector<double> solution;
+        if (!p_client.solve(csr, p_taskId, solution)) return false;
+        gridpack::math::writePetscRealVector(system.solution, solution);
+        return true;
+      } catch (const std::exception& error) {
+        abort(error.what());
+      }
+      return false;
+    }
+
+  private:
+    gridpack::math::CUDSSBrokerClient& p_client;
+    MPI_Comm p_communicator;
+    bool p_strict;
+    std::uint64_t p_taskId;
+
+    void abort(const std::string& message)
+    {
+      int rank = -1;
+      MPI_Comm_rank(p_communicator, &rank);
+      std::cerr << "p[" << rank << "] fatal cuDSS broker error: "
+                << message << std::endl;
+      MPI_Abort(p_communicator, 2);
+      throw gridpack::Exception("fatal cuDSS broker error: " + message);
+    }
+};
+
+class CABrokerAbortGuard
+{
+  public:
+    CABrokerAbortGuard(void)
+      : p_communicator(MPI_COMM_NULL), p_active(false)
+    {}
+
+    ~CABrokerAbortGuard(void)
+    {
+      if (p_active && p_communicator != MPI_COMM_NULL) {
+        std::cerr << "fatal error while the cuDSS broker was active; "
+                  << "aborting its MPI communicator" << std::endl;
+        MPI_Abort(p_communicator, 3);
+      }
+    }
+
+    void arm(MPI_Comm communicator)
+    {
+      p_communicator = communicator;
+      p_active = true;
+    }
+
+    void complete(void)
+    {
+      p_active = false;
+    }
+
+  private:
+    MPI_Comm p_communicator;
+    bool p_active;
+    CABrokerAbortGuard(const CABrokerAbortGuard&);
+    CABrokerAbortGuard& operator=(const CABrokerAbortGuard&);
+};
+
+class CAGADefaultPgroupGuard
+{
+  public:
+    explicit CAGADefaultPgroupGuard(int group)
+      : p_previous(GA_Pgroup_get_default()), p_active(true)
+    {
+      GA_Pgroup_set_default(group);
+    }
+
+    ~CAGADefaultPgroupGuard(void)
+    {
+      restore();
+    }
+
+    void restore(void)
+    {
+      if (p_active) {
+        GA_Pgroup_set_default(p_previous);
+        p_active = false;
+      }
+    }
+
+  private:
+    int p_previous;
+    bool p_active;
+    CAGADefaultPgroupGuard(const CAGADefaultPgroupGuard&);
+    CAGADefaultPgroupGuard& operator=(const CAGADefaultPgroupGuard&);
+};
 
 } // anonymous namespace
 
@@ -395,6 +754,35 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 {
   // Create world communicator for entire simulation
   gridpack::parallel::Communicator world;
+  gridpack::parallel::Communicator launch_world(world);
+  gridpack::parallel::Communicator task_comm;
+  MPI_Comm broker_communicator = MPI_COMM_NULL;
+  bool broker_enabled = false;
+  bool broker_diagnostics = false;
+  bool schedule_by_expected_pattern = false;
+  int broker_worker_count = 0;
+  gridpack::math::CUDSSBrokerOptions broker_options;
+  boost::scoped_ptr<gridpack::math::CUDSSBrokerClient> broker_client;
+  boost::scoped_ptr<CABrokerLinearSystemExecutor> broker_executor;
+  boost::scoped_ptr<gridpack::parallel::Communicator> launch_task_comm;
+  boost::scoped_ptr<gridpack::parallel::Communicator> role_world;
+  boost::shared_ptr<gridpack::powerflow::PFNetwork> pf_network;
+  boost::scoped_ptr<gridpack::parallel::TaskManager> taskmgr;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> vmag_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> vang_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> pgen_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> qgen_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> pflow_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> qflow_stats;
+  boost::scoped_ptr<gridpack::analysis::StatBlock> perf_stats;
+  // PFAppModule contains a default GridPACK communicator. Construct it while
+  // every launch rank is still participating; its communicator is replaced by
+  // the network communicator in readNetwork().
+  gridpack::powerflow::PFAppModule pf_app;
+  // Keep this guard later in declaration order than every long-lived GA owner.
+  // It therefore aborts the broker protocol before those objects unwind.
+  CABrokerAbortGuard broker_abort_guard;
+  boost::scoped_ptr<CAGADefaultPgroupGuard> ga_default_pgroup;
 
   // Get timer instance for timing entire calculation
   gridpack::utility::CoarseTimer *timer =
@@ -464,40 +852,171 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   cursor->get("outputFormat", &outputFormat);
   std::string outputFile = "ca_results";
   cursor->get("outputFile", &outputFile);
+
+  gridpack::utility::Configuration::CursorPtr broker_cursor =
+    cursor->getCursor("CUDSSBroker");
+  if (broker_cursor) {
+    broker_enabled = broker_cursor->get("Enabled", false);
+    broker_diagnostics = broker_cursor->get("Diagnostics", false);
+    schedule_by_expected_pattern = broker_cursor->get(
+        "ScheduleByExpectedPattern", false);
+  }
+  if (broker_enabled) {
+    int batch_size = 8;
+    int minimum_batch_size = 0;
+    int wait_microseconds = 0;
+    int registered_patterns = 64;
+    int device_patterns = 16;
+    broker_cursor->get("BatchSize", &batch_size);
+    minimum_batch_size = batch_size;
+    broker_cursor->get("MinimumGpuBatchSize", &minimum_batch_size);
+    broker_cursor->get("BatchWaitMicroseconds", &wait_microseconds);
+    broker_cursor->get("MaximumRegisteredPatterns", &registered_patterns);
+    broker_cursor->get("MaximumDevicePatterns", &device_patterns);
+    broker_cursor->get("Device", &broker_options.device);
+    broker_options.validateResiduals = broker_cursor->get(
+        "ValidateResiduals", broker_options.validateResiduals);
+    broker_options.residualTolerance = broker_cursor->get(
+        "ResidualTolerance", broker_options.residualTolerance);
+    broker_options.strict = broker_cursor->get(
+        "Strict", broker_options.strict);
+
+    if (grp_size != 1) {
+      throw gridpack::Exception(
+          "CUDSSBroker requires Contingency_analysis.groupSize=1");
+    }
+    if (launch_world.size() < 3) {
+      throw gridpack::Exception(
+          "CUDSSBroker requires at least two worker ranks and one owner rank");
+    }
+    const int worker_count = launch_world.size() - 1;
+    broker_worker_count = worker_count;
+    if (batch_size <= 0 || minimum_batch_size <= 0 ||
+        minimum_batch_size > batch_size || batch_size > worker_count ||
+        minimum_batch_size > worker_count || wait_microseconds < 0 ||
+        registered_patterns <= 0 || device_patterns <= 0 ||
+        broker_options.device < 0 ||
+        !std::isfinite(broker_options.residualTolerance) ||
+        broker_options.residualTolerance <= 0.0) {
+      throw gridpack::Exception("invalid CUDSSBroker configuration");
+    }
+    broker_options.ownerRank = launch_world.size() - 1;
+    broker_options.batchSize = static_cast<std::size_t>(batch_size);
+    broker_options.minimumGpuBatchSize =
+      static_cast<std::size_t>(minimum_batch_size);
+    broker_options.batchWaitMicroseconds =
+      static_cast<std::uint64_t>(wait_microseconds);
+    broker_options.maximumRegisteredPatterns =
+      static_cast<std::size_t>(registered_patterns);
+    broker_options.maximumDevicePatterns =
+      static_cast<std::size_t>(device_patterns);
+    requireKluFallback(config);
+
+    if (broker_diagnostics) {
+      std::cerr << "p[" << launch_world.rank()
+                << "] CUDSSBroker: configuration validated" << std::endl;
+    }
+
+    if (broker_diagnostics) {
+      std::cerr << "p[" << launch_world.rank()
+                << "] CUDSSBroker: duplicating protocol communicator"
+                << std::endl;
+    }
+    if (MPI_Comm_dup(static_cast<MPI_Comm>(launch_world),
+                     &broker_communicator) != MPI_SUCCESS) {
+      throw gridpack::Exception(
+          "unable to duplicate the cuDSS broker communicator");
+    }
+    // Once the owner can enter server.run(), an escaping exception on any
+    // rank would otherwise strand peers in the protocol or final barrier.
+    broker_abort_guard.arm(broker_communicator);
+    const bool broker_owner =
+      launch_world.rank() == broker_options.ownerRank;
+    if (broker_diagnostics) {
+      std::cerr << "p[" << launch_world.rank()
+                << "] CUDSSBroker: splitting worker/owner roles" << std::endl;
+    }
+    // GridPACK communicator construction creates GA process groups. Build all
+    // singleton task groups collectively from the launch world before ranks
+    // enter disjoint worker/owner control paths.
+    launch_task_comm.reset(new gridpack::parallel::Communicator(
+        launch_world.divide(grp_size)));
+    role_world.reset(new gridpack::parallel::Communicator(
+        launch_world.split(broker_owner ? 1 : 0)));
+    // GA_Create_handle() uses the process-local default process group before
+    // callers attach a handle to its final group. Keep worker-only GridPACK
+    // allocations off the launch group after the owner enters the broker.
+    ga_default_pgroup.reset(
+        new CAGADefaultPgroupGuard(role_world->getGroup()));
+    if (broker_diagnostics) {
+      std::cerr << "p[" << launch_world.rank()
+                << "] CUDSSBroker: role and task communicators ready"
+                << std::endl;
+    }
+    if (broker_owner) {
+      if (broker_diagnostics) {
+        std::cerr << "p[" << launch_world.rank()
+                  << "] CUDSSBroker: entering owner loop" << std::endl;
+      }
+      gridpack::math::CUDSSBrokerServer server(
+          broker_communicator, broker_options);
+      server.run();
+      const gridpack::math::CUDSSBrokerStatistics statistics =
+        server.statistics();
+      std::cout << "CUDSS_BROKER_SUMMARY"
+        << " requests=" << statistics.solveRequests
+        << " registrations=" << statistics.registrations
+        << " full_batches=" << statistics.fullBatches
+        << " partial_batches=" << statistics.partialBatches
+        << " fallbacks=" << statistics.fallbackResponses
+        << " errors=" << statistics.errorResponses
+        << " completed=" << statistics.batch.completedSystems
+        << std::endl;
+      MPI_Barrier(broker_communicator);
+      ga_default_pgroup.reset();
+      broker_abort_guard.complete();
+      MPI_Comm_free(&broker_communicator);
+      timer->stop(t_total);
+      return;
+    }
+    world = *role_world;
+    task_comm = *launch_task_comm;
+    broker_client.reset(new gridpack::math::CUDSSBrokerClient(
+        broker_communicator, broker_options));
+    broker_executor.reset(new CABrokerLinearSystemExecutor(
+        *broker_client, broker_communicator, broker_options.strict));
+    if (broker_diagnostics) {
+      std::cerr << "p[" << launch_world.rank()
+                << "] CUDSSBroker: worker client ready" << std::endl;
+    }
+  }
+
   // Set static flag for PFBus class BEFORE network creation.
   // This controls how Q values are reported in output functions:
   // - When check_Qlim = false: output uses calculated Q from p_Qinj
   // - When check_Qlim = true: output uses p_qg (set by chkQlim())
   gridpack::powerflow::PFBus::setQlim(check_Qlim);
-  gridpack::parallel::Communicator task_comm = world.divide(grp_size);
+  if (!broker_enabled) task_comm = world.divide(grp_size);
 
   // Keep track of failed calculations
 #ifdef USE_SUCCESS
   std::vector<int> contingency_idx;
   std::vector<bool> contingency_success;
-  gridpack::parallel::GlobalVector<bool> ca_success(world);
   std::vector<int> contingency_violation;
-  gridpack::parallel::GlobalVector<int> ca_violation(world);
   std::vector<bool> contingency_isolated;
-  gridpack::parallel::GlobalVector<bool> ca_isolated(world);
 #endif
-  boost::scoped_ptr<gridpack::parallel::GlobalVector<CAProfileRecord> >
-    ca_profile;
-  if (profile) {
-    ca_profile.reset(
-        new gridpack::parallel::GlobalVector<CAProfileRecord>(world));
-  }
-
   // Create powerflow applications on each task communicator
-  boost::shared_ptr<gridpack::powerflow::PFNetwork>
-    pf_network(new gridpack::powerflow::PFNetwork(task_comm));
-  gridpack::powerflow::PFAppModule pf_app;
+  pf_network.reset(new gridpack::powerflow::PFNetwork(task_comm));
   // Read in the network from an external file and partition it over the
   // processors in the task communicator. This will read in power flow
   // parameters from the Powerflow block in the input
   pf_app.readNetwork(pf_network,config);
   // Finish initializing the network
   pf_app.initialize();
+  if (broker_executor) {
+    broker_executor->taskId(std::numeric_limits<std::uint64_t>::max());
+    pf_app.setLinearSystemExecutor(broker_executor.get());
+  }
   //  Set minimum and maximum voltage limits on all buses
   pf_app.setVoltageLimits(Vmin, Vmax);
   // Solve the base power flow calculation. This calculation is replicated on
@@ -673,20 +1192,48 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 
   // Set up task manager on the world communicator. The number of tasks is
   // equal to the number of contingencies
-  gridpack::parallel::TaskManager taskmgr(world);
+  taskmgr.reset(new gridpack::parallel::TaskManager(world));
   int ntasks = events.size();
-  taskmgr.set(ntasks);
+  std::vector<gridpack::contingency_analysis::PatternScheduleEpoch>
+    task_epochs;
+  if (schedule_by_expected_pattern && ntasks > 0) {
+    std::vector<std::string> expected_pattern_classes;
+    expected_pattern_classes.reserve(events.size());
+    gridpack::contingency_analysis::ExpectedJacobianPatternClassifier
+      pattern_classifier(pf_network);
+    for (std::size_t event = 0; event < events.size(); ++event) {
+      expected_pattern_classes.push_back(pattern_classifier.classify(
+          events[event]));
+    }
+    const std::size_t batch_size = broker_options.batchSize;
+    const std::size_t epoch_size =
+      (static_cast<std::size_t>(broker_worker_count) / batch_size) *
+        batch_size;
+    task_epochs = gridpack::contingency_analysis::buildPatternSchedule(
+        expected_pattern_classes, epoch_size);
+    if (world.rank() == 0) {
+      std::set<std::string> distinct_classes(
+          expected_pattern_classes.begin(), expected_pattern_classes.end());
+      std::cout << "CUDSS_PATTERN_SCHEDULE"
+                << " tasks=" << ntasks
+                << " classes=" << distinct_classes.size()
+                << " epochs=" << task_epochs.size()
+                << " epoch_size=" << epoch_size
+                << std::endl;
+    }
+  } else if (ntasks > 0) {
+    gridpack::contingency_analysis::PatternScheduleEpoch epoch;
+    epoch.expectedPatternClass = "input-order";
+    epoch.taskIds.reserve(events.size());
+    for (int task = 0; task < ntasks; ++task) {
+      epoch.taskIds.push_back(task);
+    }
+    task_epochs.push_back(epoch);
+  }
 
   int nbus = pf_network->totalBuses();
   // Get bus voltage information for base case
   int i, j;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> vmag_stats;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> vang_stats;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> pgen_stats;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> qgen_stats;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> pflow_stats;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> qflow_stats;
-  boost::scoped_ptr<gridpack::analysis::StatBlock> perf_stats;
   std::vector<std::string> v_vals;
   int nsize = 0;
   std::vector<double> vmag, vang, pgen, qgen, pflow, qflow, perf;
@@ -835,12 +1382,20 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 
   // Evaluate contingencies using the task manager
   int task_id;
+  int scheduled_local_tasks = 0;
   char sbuf[128];
   int t_tasks = timer->createCategory("Contingency: Execute Tasks");
   timer->start(t_tasks);
-  // nextTask returns the same task_id on all processors in task_comm. When the
-  // calculation runs out of task, nextTask will return false.
-  while (taskmgr.nextTask(task_comm, &task_id)) {
+  // The dispatcher synchronizes workers between pattern epochs and returns
+  // original task IDs on every process in task_comm.
+  CAContingencyTaskDispatcher task_dispatcher(*taskmgr, task_epochs);
+  while (task_dispatcher.nextTask(task_comm, &task_id)) {
+    if (schedule_by_expected_pattern && task_comm.rank() == 0) {
+      ++scheduled_local_tasks;
+    }
+    if (broker_executor) {
+      broker_executor->taskId(static_cast<std::uint64_t>(task_id));
+    }
     CAProfileRecord profile_record = {};
     profile_record.finalTolerance =
       std::numeric_limits<double>::quiet_NaN();
@@ -956,7 +1511,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         contingency_isolated.push_back(false);
 #endif
         if (outputFormat != "text") {
-          gridpack::utility::ContingencyResult ctResult;
+          gridpack::utility::ContingencyResult ctResult = {};
           ctResult.name = events[task_id].p_name;
           ctResult.type = (events[task_id].p_type == Branch) ? "branch" : "generator";
           ctResult.hasVoltageViolation = false;
@@ -982,7 +1537,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         bool ok = ok1 && ok2;
         // Collect results for JSON/CSV export
         if (outputFormat != "text") {
-          gridpack::utility::ContingencyResult ctResult;
+          gridpack::utility::ContingencyResult ctResult = {};
           ctResult.name = events[task_id].p_name;
           ctResult.type = (events[task_id].p_type == Branch) ? "branch" : "generator";
           ctResult.hasVoltageViolation = !ok1;
@@ -1123,7 +1678,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       contingency_isolated.push_back(false);
 #endif
       if (outputFormat != "text") {
-        gridpack::utility::ContingencyResult ctResult;
+        gridpack::utility::ContingencyResult ctResult = {};
         ctResult.name = events[task_id].p_name;
         ctResult.type = (events[task_id].p_type == Branch) ? "branch" : "generator";
         ctResult.hasVoltageViolation = false;
@@ -1235,32 +1790,49 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     }
   }
   timer->stop(t_tasks);
+  if (broker_client) {
+    pf_app.setLinearSystemExecutor(NULL);
+    broker_client->done();
+    broker_executor.reset();
+    broker_client.reset();
+  }
   int t_output = timer->createCategory("Contingency: Output Pipeline");
   timer->start(t_output);
   // Print statistics from task manager describing the number of tasks performed
   // per processor
-  taskmgr.printStats();
+  if (schedule_by_expected_pattern) {
+    std::vector<int> tasks_per_process(world.size(), 0);
+    tasks_per_process[world.rank()] = scheduled_local_tasks;
+    MPI_Allreduce(MPI_IN_PLACE, &tasks_per_process[0], world.size(), MPI_INT,
+                  MPI_SUM, static_cast<MPI_Comm>(world));
+    if (world.rank() == 0) {
+      printf("\nNumber of tasks per processors\n");
+      for (int process = 0; process < world.size(); ++process) {
+        printf("  Number of tasks on process %6d: %6d\n", process,
+               tasks_per_process[process]);
+      }
+    }
+  } else {
+    taskmgr->printStats();
+  }
+  brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                   "task statistics complete");
 
   // Gather stats on successful contingency calculations
 #ifdef USE_SUCCESS
-  if (task_comm.rank() == 0) {
-    ca_success.addElements(contingency_idx, contingency_success);
-    ca_violation.addElements(contingency_idx, contingency_violation);
-    ca_isolated.addElements(contingency_idx, contingency_isolated);
+  if (task_comm.rank() != 0) {
+    contingency_idx.clear();
+    contingency_success.clear();
+    contingency_violation.clear();
+    contingency_isolated.clear();
   }
-  ca_success.upload();
-  ca_violation.upload();
-  ca_isolated.upload();
-  // All processes call getData to ensure GA progress (NGA_Gather requires
-  // remote process participation for one-sided communication).
+  gatherContingencyStatus(world, contingency_idx, contingency_success,
+                          contingency_violation, contingency_isolated,
+                          ntasks);
+  brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                   "contingency status gathered");
   contingency_idx.clear();
-  contingency_success.clear();
-  contingency_violation.clear();
-  contingency_isolated.clear();
   for (i=0; i<ntasks; i++) contingency_idx.push_back(i);
-  ca_success.getData(contingency_idx, contingency_success);
-  ca_violation.getData(contingency_idx, contingency_violation);
-  ca_isolated.getData(contingency_idx, contingency_isolated);
   // Write out stats on successful calculations
   if (world.rank() == 0) {
     std::ofstream fout;
@@ -1290,14 +1862,17 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 #endif
 
   if (profile) {
-    ca_profile->addElements(local_profile_indices, local_profile_records);
-    ca_profile->upload();
-    std::vector<int> all_profile_indices;
-    std::vector<CAProfileRecord> all_profile_records;
-    for (i=0; i<ntasks; i++) all_profile_indices.push_back(i);
-    ca_profile->getData(all_profile_indices, all_profile_records);
+    brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                     "profile records staged");
+    std::vector<CAProfileRecord> all_profile_records =
+      gatherProfileRecords(world, local_profile_indices,
+                           local_profile_records, ntasks);
+    brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                     "profile records gathered");
     int base_replicas = task_comm.rank() == 0 ? 1 : 0;
     world.sum(&base_replicas, 1);
+    brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                     "profile base count reduced");
     int profile_write_ok = 1;
     if (world.rank() == 0) {
       std::ofstream profile_out(profile_file.c_str());
@@ -1305,7 +1880,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       profile_out
         << "task_id,contingency,type,status,power_flow_solves,"
         << "linear_solves,newton_updates,reported_newton_iterations,"
-        << "controller_passes,area_interchange_passes,final_tolerance\n";
+        << "controller_passes,area_interchange_passes,mapper_rebuilds,"
+        << "mapper_reuses,final_tolerance\n";
       profile_out << -1
         << ",\"base_case_world_rank_0_representative\",base_case,"
         << (base_solve_ok ? "converged" : "divergent") << ","
@@ -1315,12 +1891,16 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         << base_profile.reportedNewtonIterations << ","
         << base_profile.controllerLoopPasses << ","
         << base_profile.areaInterchangePasses << ","
+        << base_profile.mapperWorkspaceRebuilds << ","
+        << base_profile.mapperWorkspaceReuses << ","
         << std::setprecision(17) << base_profile.finalTolerance << "\n";
 
       int status_counts[PROFILE_SLACK_OVERLOAD + 1] = {};
       long long linear_solves = 0;
       long long newton_updates = 0;
       long long controller_passes = 0;
+      long long mapper_rebuilds = 0;
+      long long mapper_reuses = 0;
       for (i=0; i<ntasks; i++) {
         const CAProfileRecord& record = all_profile_records[i];
         if (record.status >= PROFILE_CONVERGED &&
@@ -1330,6 +1910,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         linear_solves += record.linearSolveCalls;
         newton_updates += record.completedNewtonUpdates;
         controller_passes += record.controllerLoopPasses;
+        mapper_rebuilds += record.mapperWorkspaceRebuilds;
+        mapper_reuses += record.mapperWorkspaceReuses;
         profile_out << i << "," << csvField(events[i].p_name) << ","
           << (events[i].p_type == Branch ? "branch" : "generator") << ","
           << profileStatusName(record.status) << ","
@@ -1339,6 +1921,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
           << record.reportedNewtonIterations << ","
           << record.controllerLoopPasses << ","
           << record.areaInterchangePasses << ","
+          << record.mapperWorkspaceRebuilds << ","
+          << record.mapperWorkspaceReuses << ","
           << std::setprecision(17) << record.finalTolerance << "\n";
       }
       profile_out.close();
@@ -1355,9 +1939,13 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         << " contingency_linear_solves=" << linear_solves
         << " contingency_newton_updates=" << newton_updates
         << " contingency_controller_passes=" << controller_passes
+        << " contingency_mapper_rebuilds=" << mapper_rebuilds
+        << " contingency_mapper_reuses=" << mapper_reuses
         << std::endl;
     }
     world.min(&profile_write_ok, 1);
+    brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                     "profile output complete");
     if (profile_write_ok == 0) {
       throw gridpack::Exception(
           "Unable to write contingency profile file " + profile_file);
@@ -1366,6 +1954,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 
   // Sync GA before MPI collectives to flush any pending one-sided operations
   world.sync();
+  brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                   "output GA synchronization complete");
 
   // Export CA results to JSON or CSV.
   // Only rank 0 writes output files. Non-zero ranks send their serialized
@@ -1603,11 +2193,22 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     timer->stop(t_stats);
   }
   timer->stop(t_output);
+  if (broker_enabled) {
+    brokerDiagnostic(broker_diagnostics, launch_world.rank(),
+                     "entering final protocol barrier");
+    MPI_Barrier(broker_communicator);
+    ga_default_pgroup.reset();
+    broker_abort_guard.complete();
+    MPI_Comm_free(&broker_communicator);
+  }
   timer->stop(t_total);
   // If all processors executed at least one task, then print out timing
   // statistics (this printout does not work if some processors do not define
   // all timing variables)
-  if (events.size()*grp_size >= world.size()) {
+  // CoarseTimer::dump() always reduces over GA_MPI_Comm (the launch world).
+  // In broker mode the dedicated GPU owner has already left the CA worker
+  // path, so invoking that collective here would deadlock during teardown.
+  if (!broker_enabled && events.size()*grp_size >= world.size()) {
     timer->dump();
   }
 }
