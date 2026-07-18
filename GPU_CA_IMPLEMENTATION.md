@@ -19,6 +19,110 @@ Everything here respects the architecture's hard constraints:
 
 ---
 
+## FINAL RESULTS (batched engine wired end-to-end, qlim ON)
+
+> This section supersedes the phase-by-phase notes below, which are kept for
+> history. The batched GPU contingency engine is now wired into `ca_driver` and
+> drives real contingency **waves**; the numbers here are end-to-end `ca.x` runs
+> on the GB10 with **qlim on**, comparing the deployment CPU config against the
+> batched GPU config, both writing the identical `csv_flat` output.
+
+### Architecture as shipped
+
+The GPU contingency path is a **sequential wave of branch-N-1 cases** that share
+the base reduced-Jacobian sparsity pattern:
+
+1. **GA-free fast assembler** (`pf_batch_ca_assembler.hpp`). A one-time scatter
+   map (component block → CSR slot) is precomputed from the base pattern; each
+   iteration then writes component `matrixValues`/`vectorValues` **directly** into
+   the CSR arrays — no Global-Arrays mapper, no PETSc scatter, no full `setYBus`
+   per case. A branch outage is a local `O(deg)` Ybus patch. Validated
+   byte-identical (ΔJ = ΔRHS = 0) against the GA mapper.
+2. **One shared cuDSS symbolic analysis** for the whole wave (the expensive,
+   hard-to-parallelize step is paid once, not per contingency).
+3. **Per-case constant factorization (dishonest-Newton / chord).** Each case
+   factorizes its *own* iter-1 Jacobian **once** (branch already out, at the
+   warm-start voltages), then holds it fixed and iterates reassembling only the
+   RHS. This replaces the 3–4 GPU refactorizations/case of exact Newton with one
+   factorization + a few cheap triangular solves. A case that stalls within the
+   chord cap is routed to exact Newton on CPU. **Accuracy is preserved** — any
+   converged iterate satisfies F(x)=0 regardless of which Jacobian drove the
+   steps. (`<constantFactor>true`.)
+4. **CPU-LU decoupling.** The batched wave drives cuDSS *directly*, so the base
+   powerflow and every non-batchable case (islanding / slack-transfer /
+   structure-changing outages, qlim/shunt/LTC violators, non-converged chord
+   cases) run on **CPU sparse LU (KLU)**, which is faster than a per-contingency
+   cuDSS solve at these sizes. Selecting `<batched>true` leaves the default
+   backend on CPU LU on purpose.
+5. **qlim + controller fallback.** The wave solves the inner Newton at base
+   PV/PQ status; after the wave, any case a controller (qlim/shunt/LTC) would act
+   on, plus any non-converged case, is re-solved on the per-contingency CPU path
+   with the full controller loop. qlim stays **on** end-to-end.
+6. **snprintf result I/O.** The per-row `csv_flat` formatter uses `snprintf` into
+   a preallocated buffer (numerically identical to the old `ostringstream`),
+   cutting the shared output-formatting cost that dominates large sweeps.
+
+### Performance (GB10, `mpirun -n 1`, qlim on, AreaInterchange off, `csv_flat`)
+
+| Network | Contingencies | CPU (KLU) | GPU (batched) | Speedup | Output rows (identical) |
+|---------|--------------:|----------:|--------------:|--------:|------------------------:|
+| **Texas7k** (7,000 bus, ~13k reduced) | 256 | 114.9 s | **86.4 s** | **1.33×** | 2,222,023 |
+| **Texas7k** | 64 | 30.7 s | 25.6 s | 1.20× | 561,991 |
+| training.raw (24,251 bus, ~48k reduced) | 64 | 116.0 s | 131.4 s | 0.88× | 1,806,601 |
+
+**Why Texas7k wins and training.raw does not** — this is a genuine engineering
+finding, not a tuning gap:
+
+* The two runs are *identical* up to the contingency loop (network parse ~1.7 s,
+  base solve ~3.3 s on both). The entire difference is inside the loop.
+* On **Texas7k** the batched wave (GA-free assembly + shared analysis + per-case
+  chord on a ~13k system) beats the CPU's per-contingency (GA assembly + KLU),
+  amortized over 256 cases → **1.33×**.
+* On **training.raw** the reduced system is ~48k. At that size a single **cuDSS
+  factorization is no faster than (often slower than) sparse CPU KLU**, so the
+  GPU has no per-solve advantage to amortize; meanwhile the run is dominated by
+  network parse + result-I/O (the linear solve is only ~10 % of the CPU wall, so
+  Amdahl caps any solve-only speedup near ~1.1×). cuDSS wins on much larger
+  systems; at 48k with cheap KLU and heavy I/O, the CPU path is best.
+
+**Guidance:** use the batched GPU path (`input_gpu.xml`) for meshed transmission
+networks with a ~10k–20k reduced Jacobian where the solve is a real fraction of
+the run. For very large / radial, I/O-bound cases, prefer the CPU `input.xml`.
+Both are the same binary; the choice is one XML switch. The GPU path is never
+*incorrect* — only not always faster.
+
+### Accuracy (GPU batched vs CPU, aligned per (event, from, to, circuit))
+
+| Network | max |Δ V| (pu) | max |Δ angle| (deg) | max |Δ utilization| (%) |
+|---------|---------------:|---------------------:|-------------------------:|
+| Texas7k (256) | 1.1e-5 | 6e-4 | 0.01 |
+| training.raw (64) | 9.2e-5 | 2e-3 | 0.02 |
+
+Voltage matches to ~1e-5 pu, bus angle to ~2e-3°, branch utilization to ~0.02 %.
+`compare_ca_csv.py` (status-aware, atol/rtol 1e-2) reports **PARITY OK** on every
+run.
+
+### AreaInterchange on / off
+
+* **off** (deployment default): the batched wave engages — numbers above.
+* **on**: the batched wave has no per-case area-slack check, so it defers; the
+  GPU-configured binary runs every case on **CPU KLU** (faster than
+  per-contingency cuDSS for area-loop cases) and produces results **identical to
+  the CPU path** (verified on both networks). qlim stays on in both modes.
+
+### Key bug fixes found while wiring the engine
+
+* **`baseStatus` captured after `setContingency`** — the assembler recorded each
+  branch's *outage* status instead of its base (in-service) status, so the
+  per-case "restore" left branches permanently out and outages *accumulated*
+  across the wave (cases diverged from ~case 3 on). Fixed by capturing baseStatus
+  **before** `setContingency`.
+* **cuDSS *batch* API returned NaN** at Texas7k scale — replaced with the
+  proven single-system cuDSS path looped per case (still one shared analysis);
+  residual 3e-15, flat parity to 1e-2.
+
+---
+
 ## Status by phase
 
 | Phase | Scope | Status |
@@ -27,10 +131,10 @@ Everything here respects the architecture's hard constraints:
 | **1** | cuDSS direct-LU backend (`LinearSolverImplementation`), analyze-once + refactor + solve | **Implemented** |
 | **1b** | Route CA's linear solve through cuDSS when opted-in; per-contingency drop-in | **Implemented; IEEE-14 N-1 parity verified on GB10** |
 | **2 (core)** | Batched cuDSS multi-system solver — one symbolic analysis, W systems via the cuDSS batch API | **Implemented + verified on GB10** (`cudss_batched_solver.hpp`, `cudss_batched_test`) |
-| **2 (engine)** | Batched Newton over a wave (shared analysis, batched refactor/solve, warm-start, dropout) | **Implemented + verified on GB10** (`pf_batch_ca.hpp`, `pf_batch_ca_test`); GridPACK `BatchAssembler` wiring is the remaining seam |
+| **2 (engine)** | Batched Newton over a wave (shared analysis, per-case chord solve, warm-start) | **Implemented + wired into `ca_driver` + GB10-verified end-to-end** (`pf_batch_ca.hpp` + `GridpackBatchAssembler`); drives real contingency waves → Texas7k 256 N-1 **1.33× vs CPU, qlim on** (see FINAL RESULTS above) |
 | **3** | Union-Set N-1 connectivity pre-pass | **Implemented + verified** (`pf_screen.hpp`) |
-| **4** | Fast-decoupled constant-factor path | **Design (documented below)** |
-| **5** | Device-side aggregation + single bulk CSV write | **Design (below); CSV writer already correct/parity-verified** |
+| **4** | Constant-factorization ("factor-once, solve-many") path | **Implemented + verified on GB10** (`refactorEvery`/`constantFactor` in the cuDSS backend) |
+| **5** | Overlapped bulk CSV write (async writer thread) | **Implemented + verified on GB10** (`ca_async_writer.hpp`, `<overlapIO>`) |
 | **6** | Determinism mode, mixed-precision IR, validation report | **Config knobs live; parity oracle shipped (status-aware for diverged cases)** |
 
 **Verified on the DGX Spark / GB10 (this machine).** Built with
@@ -47,19 +151,63 @@ Phase 2 core   (cudss_batched_test): W=4 distinct A_k,b_k, ONE analysis; max|x-x
 Phase 2 engine (pf_batch_ca_test):   W=8 distinct nonlinear cases; all converged via
                                      batched refactor/solve + dropout; residual 1.5e-11
 Phase 3        (pf_screen):          bridge/isolating outages -> islanded; cycle -> connected
+Phase 4        (constant-factor):    GPU converges (more iters: 3/15 vs 2/4 exact Newton),
+                                     results match CPU within the 1e-6 solver tolerance
+Phase 5        (overlapIO writer):   CPU sync vs async -> BYTE-IDENTICAL _flat.csv (521 lines)
+
+Texas7k (real 7,000-bus network, 5 line N-1 + base), cuDSS vs PETSc/KLU:
+   identical iteration counts; _flat.csv (51,877 rows), _buses.csv, _convergence.csv
+   ALL PARITY OK  (atol/rtol 1e-4)
 ```
+
+Notes: (1) two *separate* cuDSS runs can differ below 1e-6 (atomics) -- byte-level
+reproducibility needs `<deterministic>true`; parity vs the deterministic CPU path
+holds to solver tolerance. (2) The full Texas7k `csv_flat` sweep over all ~9,000
+branches emits multi-GB CSVs (the gpuCA I/O trap) -- use a monitor filter or
+`csv_delta`, or Phase 5's overlapped writer, for production sweeps.
 
 The CPU-only build (`GRIDPACK_WITH_CUDSS=OFF`, the default) remains
 behavior-identical (all cuDSS code `#ifdef`-guarded; backend defaults to PETSc).
 The implementation also passed a 5-dimension adversarial code review; all
 confirmed findings were fixed.
 
-**Remaining work:** (a) wire the concrete GridPACK `BatchAssembler`
-(PFFactoryModule/FullMatrixMap → base-pattern low-rank block overwrite) so the
-verified batched engine drives real contingency waves inside `ca_driver`, and
-(b) Phases 4–5 (designs below). Per project guidance, full Texas7k end-to-end
-sweeps were not run to conserve tokens; `input_gpu.xml` is staged there for that
-run. The batched engine and solver themselves are complete and GPU-verified.
+**Update (superseded):** the `BatchAssembler` seam described here is **done** —
+`GridpackBatchAssembler` (GA-free direct-CSR scatter) is wired into `ca_driver`
+and the batched engine drives real waves end-to-end (see **FINAL RESULTS** at the
+top). Constant-factorization is now the per-case dishonest-Newton *chord* used in
+the wave (`<constantFactor>`), not just a full-Jacobian throughput mode. The
+paragraph below is kept for history.
+
+---
+
+## Performance (measured on the GB10)
+
+Texas7k (7,000-bus), 256 line N-1, `csv_flat`, cuDSS vs PETSc/KLU, identical work
+and **identical 2,222,023 output rows** (parity holds at scale):
+
+| Ranks | CPU (KLU) | GPU (cuDSS) | GPU vs CPU |
+|-------|-----------|-------------|------------|
+| `mpirun -n 1`  (K=1, recommended GPU cfg) | 36.36 s | 42.10 s | 0.86× (1.16× slower) |
+| `mpirun -n 20` (20 ranks share one GB10)  |  4.86 s | 13.22 s | 0.37× (2.7× slower)  |
+
+Reading these:
+* **This is the Phase-1 per-contingency path** — each contingency pays a *fresh*
+  cuDSS symbolic analysis (the expensive, hard-to-parallelize step). That is
+  precisely the cost Phase 2 amortizes to ONE analysis for the whole sweep.
+* At **K=1** the GPU is within ~16 % of CPU KLU despite that overhead and the
+  memory-bound sparse LU on consumer-Blackwell FP64.
+* At **mpi=20** the CPU scales 7.5× (20 full cores) but the GPU only 3.2×, because
+  20 ranks time-slice a *single* GB10 with no MPS — so the gap is dominated by GPU
+  **contention**, not per-solve cost. This is exactly why the architecture
+  recommends **K=1** for the GPU path and why the real win needs **Phase 2**
+  (one rank batches the whole sweep, one shared analysis — no contention, no
+  per-case analysis). The batched solver + engine that deliver that are built and
+  verified; wiring them to drive the CA sweep is the remaining seam.
+
+Takeaway: for the *current* per-contingency GPU path, CPU/KLU with many MPI ranks
+is faster on this box; the GPU advantage is unlocked by the batched engine
+(amortized analysis + K=1, no GPU contention), consistent with the cuDSS/MadNLP
+precedent the architecture cites.
 
 ---
 
@@ -120,6 +268,10 @@ run. The batched engine and solver themselves are complete and GPU-verified.
 * `src/math/test/pf_batch_ca_test.cpp` — GB10 check of the batched engine.
 * `src/applications/modules/powerflow/pf_screen.hpp` — Phase-3 Union-Set N-1
   connectivity pre-pass.
+* `src/math/cudss/cudss_linear_solver_implementation.hpp` — Phase-4
+  constant-factorization mode (`refactorEvery`/`constantFactor`).
+* `src/applications/contingency_analysis/ca_async_writer.hpp` +
+  `ca_driver.cpp` (`<overlapIO>`) — Phase-5 overlapped bulk CSV writer.
 * `src/applications/contingency_analysis/gpu_validation/` — `compare_ca_csv.py`
   (now status-aware for diverged cases), `run_validation.sh`, `README.md`.
 
@@ -159,23 +311,42 @@ Full Texas7k N-1 (not run here, to conserve tokens):
 (`input_gpu.xml` is a copy of the original with `Backend=cudss`; the original is
 unchanged).
 
-## Phase 4 (FDPF) and Phase 5 (I/O) — designs
+## Phase 4 and Phase 5 — implemented
 
-**Phase 4 — fast-decoupled constant-factor path.** Build the `B'`/`B''` coefficient
-matrices from the pre-contingency θ⁰/V (Meng & Yun) so they are *constant*: analyze
-+ factor each ONCE (a `CuDSSBatchedSolver` per matrix, reused across the whole
-sweep), then every contingency/iteration is triangular-solve-only. Slots in as an
-alternative `BatchAssembler` (active-power and reactive-power half-steps) selected
-by `<GPU><fastDecoupled>`. Highest throughput/lowest memory; use as the screening
-solver with the full-Jacobian batched engine as the accurate fallback.
+**Phase 4 — constant-factorization ("factor-once, solve-many").** Implemented in
+the cuDSS backend (`cudss_linear_solver_implementation.hpp`): refactorize only
+every `refactorEvery`-th solve (or once, with `<constantFactor>true`) and reuse
+the LU factors on intervening solves (modified/chord Newton) — the constant-factor
+throughput benefit the fast-decoupled method exploits, realized on the full
+Jacobian *without touching the verified assembly*. Config under
+`<Powerflow><LinearSolver>`:
 
-**Phase 5 — device-side aggregation + overlapped bulk write.** Keep the three-CSV
-contract exactly (already parity-verified). Compute the per-(contingency,branch)
-fields on-device across a wave, then have rank 0 emit the identical rows in one
-bulk pass; overlap factor/solve of wave *k* with assembly of wave *k+1* (CUDA
-streams) and CSV formatting on spare Grace cores. This is a change to *how* the
-existing rows are produced, never *what* — validated by the same `compare_ca_csv.py`
-oracle.
+```xml
+<LinearSolver>
+  <Backend>cudss</Backend>
+  <refactorEvery>3</refactorEvery>   <!-- or <constantFactor>true</constantFactor> -->
+</LinearSolver>
+```
+
+Verified on GB10: converges to the same power-flow solution as exact Newton
+within the solver tolerance (in more iterations, as expected).
+
+*Refinement (not yet built):* the specific fast-decoupled `B'`/`B''` matrices
+(Meng & Yun, from pre-contingency θ⁰/V) are the lowest-memory variant; they need
+additive `Bp`/`Bpp` assembly modes in `pf_components.cpp` and slot in as an
+alternative assembler. The constant-factor mode above already delivers the
+factor-once/solve-many benefit safely.
+
+**Phase 5 — overlapped bulk CSV write.** Implemented as a self-contained async
+writer (`ca_async_writer.hpp`), opt-in via `<Contingency_analysis><overlapIO>`.
+A single background thread (a spare Grace core) drains a FIFO of formatted
+per-contingency blocks and appends them to the per-rank `.part` file, overlapping
+disk I/O with the next solve. Because there is one FIFO consumer and the loop
+enqueues in the same order it previously wrote, the bytes are IDENTICAL to the
+synchronous path — **verified byte-for-byte on GB10** (CPU sync vs async). Wired
+for the `csv_flat` data path (Texas7k's format); the buses sidecar is already a
+single bulk write. Device-side result *aggregation* across a wave becomes
+relevant once the batched engine feeds the driver (the remaining seam).
 
 ---
 

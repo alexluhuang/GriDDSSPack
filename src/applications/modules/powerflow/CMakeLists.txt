@@ -59,9 +59,12 @@ target_link_libraries(gridpack_powerflow_module
 # -------------------------------------------------------------
 # installation
 # -------------------------------------------------------------
-install(FILES 
+install(FILES
   pf_app_module.hpp
   pf_factory_module.hpp
+  pf_batch_ca.hpp
+  pf_batch_ca_assembler.hpp
+  pf_screen.hpp
   DESTINATION include/gridpack/applications/modules/powerflow
 )
 

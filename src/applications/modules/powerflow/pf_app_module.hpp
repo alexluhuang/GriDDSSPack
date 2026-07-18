@@ -158,6 +158,24 @@ class PFAppModule
     gridpack::utility::ConvergenceSummary getConvergence() const;
 
     /**
+     * Inject a convergence summary (used by the GPU batched engine, whose cases
+     * skip solve() and so would otherwise leave p_convergence stale for
+     * collectResults()).
+     */
+    void setConvergence(const gridpack::utility::ConvergenceSummary& cs)
+    { p_convergence = cs; }
+
+    /**
+     * Accessors for the GPU batched contingency engine (Phase 2). Expose the
+     * shared network / factory / configuration so a BatchAssembler can drive
+     * per-case Jacobian assembly through the existing mapper + component
+     * contract (so the assembled systems match the per-case CPU path).
+     */
+    boost::shared_ptr<PFNetwork> getNetwork() { return p_network; }
+    boost::shared_ptr<PFFactoryModule> getFactory() { return p_factory; }
+    gridpack::utility::Configuration* getConfiguration() { return p_config; }
+
+    /**
      * Collect power flow results into structured format for export
      */
     gridpack::utility::PowerFlowResults collectResults();

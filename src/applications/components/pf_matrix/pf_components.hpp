@@ -56,6 +56,7 @@
 #ifndef _pf_components_h_
 #define _pf_components_h_
 
+#include <cmath>
 #include "boost/smart_ptr/shared_ptr.hpp"
 #include "gridpack/utilities/complex.hpp"
 #include "gridpack/component/base_component.hpp"
@@ -338,6 +339,22 @@ class PFBus
       p_v = v; p_voltage = v;
       if (p_vMag_ptr) *p_vMag_ptr = v;
     }
+    // Absolute set of the Newton iterate (voltage magnitude p_v, angle p_a)
+    // WITHOUT altering the parser-initial p_voltage/p_angle (the reset targets).
+    // Used by the batched GPU contingency engine (pf_batch_ca) to swap a shared
+    // serial network's state between per-case iterates; mirrors the [-pi,pi]
+    // angle wrapping the Newton update (setValues) writes to the exchange buffer.
+    void setVoltageState(double v, double a) {
+      p_v = v; p_a = a;
+      if (p_vMag_ptr) *p_vMag_ptr = v;
+      if (p_vAng_ptr) {
+        const double pi = 4.0*std::atan(1.0);
+        *p_vAng_ptr = (a >= 0.0) ? std::fmod(a+pi, 2.0*pi)-pi
+                                 : std::fmod(a-pi, 2.0*pi)+pi;
+      }
+    }
+    // Read the current Newton iterate (magnitude, angle) for snapshotting.
+    void getVoltageState(double &v, double &a) const { v = p_v; a = p_a; }
     void saveIsPVState() { p_saveisPV = p_isPV; p_save2isPV = p_isPV; }
     void setVoltageForIREG(double v) {
       p_v = v; p_voltage = v;

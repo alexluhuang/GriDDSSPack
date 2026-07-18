@@ -87,7 +87,8 @@ public:
       p_d_rhs(NULL), p_d_sol(NULL),
       p_analyzed(false), p_matricesCreated(false),
       p_nCached(-1), p_nnzCached(-1),
-      p_irSteps(0), p_deterministic(false), p_hybridMemory(false)
+      p_irSteps(0), p_deterministic(false), p_hybridMemory(false),
+      p_refactorEvery(1), p_solveCount(0), p_factored(false)
   {
     p_valType = cudssPetscValueType();
     p_idxType = cudssPetscIndexType();
@@ -156,6 +157,17 @@ protected:
   cudssDataType_t p_valType;   ///< cuDSS value type of the PETSc scalar
   cudssDataType_t p_idxType;   ///< cuDSS integer type of the PETSc index
 
+  // ---- Phase-4 constant-factorization ("factor-once, solve-many") -------
+  // Refactorize only every p_refactorEvery-th solve; intervening solves reuse
+  // the existing LU factors (modified/chord Newton).  1 = refactor every solve
+  // (exact Newton, the default).  A large value = factor once and reuse -- the
+  // constant-factor throughput mode the fast-decoupled method exploits, here
+  // realized on the full Jacobian without touching the verified assembly.  It
+  // converges to the SAME solution (possibly in more iterations).
+  int  p_refactorEvery;
+  mutable long p_solveCount;   ///< solves since construction
+  mutable bool p_factored;     ///< do valid LU factors exist for the current pattern
+
   // ---------------------------------------------------------------------
   // p_freeDeviceAndMatrices
   // ---------------------------------------------------------------------
@@ -175,6 +187,7 @@ protected:
     if (p_d_rhs)    { cudaFree(p_d_rhs);    p_d_rhs = NULL; }
     if (p_d_sol)    { cudaFree(p_d_sol);    p_d_sol = NULL; }
     p_analyzed = false;
+    p_factored = false;   // factors are invalid once the pattern is rebuilt
   }
 
   // ---------------------------------------------------------------------
@@ -243,17 +256,26 @@ protected:
 
     p_prepare(csr);   // alloc + pattern upload + ANALYSIS (once per pattern)
 
-    // Upload the (changed) nonzero values and numerically refactorize.
-    const PetscInt nnz = csr.nnz();
-    if (nnz > 0) {
-      GP_CUDA_CHECK(cudaMemcpy(p_d_values, csr.values(),
-                               nnz * sizeof(PetscScalar),
-                               cudaMemcpyHostToDevice));
+    // Constant-factorization (Phase 4): refactorize only every p_refactorEvery
+    // solves; otherwise reuse the existing LU factors (modified Newton).  Always
+    // (re)factor if no valid factors exist yet for the current pattern.
+    const bool refactor = (!p_factored) || (p_refactorEvery <= 1) ||
+                          (p_solveCount % p_refactorEvery == 0);
+    ++p_solveCount;
+    if (refactor) {
+      // Upload the (changed) nonzero values and numerically refactorize.
+      const PetscInt nnz = csr.nnz();
+      if (nnz > 0) {
+        GP_CUDA_CHECK(cudaMemcpy(p_d_values, csr.values(),
+                                 nnz * sizeof(PetscScalar),
+                                 cudaMemcpyHostToDevice));
+      }
+      GP_CUDSS_CHECK(cudssExecute(p_handle, CUDSS_PHASE_FACTORIZATION,
+                                  p_config, p_data, p_Amat, p_xMat, p_bMat));
+      p_factored = true;
     }
-    GP_CUDSS_CHECK(cudssExecute(p_handle, CUDSS_PHASE_FACTORIZATION,
-                                p_config, p_data, p_Amat, p_xMat, p_bMat));
 
-    // Solve with the freshly computed factors.
+    // Solve (with fresh or reused factors).
     this->p_resolveImpl(b, x);
   }
 
@@ -315,6 +337,12 @@ protected:
       }
       p_deterministic = props->get("deterministic", p_deterministic);
       p_hybridMemory  = props->get("hybridMemory", p_hybridMemory);
+
+      // Phase-4 constant-factor throughput mode.  refactorEvery=K refactors
+      // every K-th solve; constantFactor=true factors once and reuses.
+      p_refactorEvery = props->get("refactorEvery", p_refactorEvery);
+      if (props->get("constantFactor", false)) p_refactorEvery = 1000000000;
+      if (p_refactorEvery < 1) p_refactorEvery = 1;
     }
 
     // The base p_configure sets p_doSerial from the "ForceSerial" option

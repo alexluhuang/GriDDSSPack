@@ -44,6 +44,11 @@ if (GOSS_DIR)
 endif()
 
 include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR})
+# The GPU batched contingency engine (pf_batch_ca_assembler.hpp) pulls in the
+# math cuDSS/PETSc extractor headers, which use math-directory-relative includes
+# (cudss/..., petsc/..., vector.hpp, implementation_visitor.hpp).  Put src/math
+# on ca.x's include path, exactly as the math-internal consumers have it.
+include_directories(BEFORE ${CMAKE_SOURCE_DIR}/math)
 if (GA_FOUND)
   include_directories(AFTER ${GA_INCLUDE_DIRS})
 endif()

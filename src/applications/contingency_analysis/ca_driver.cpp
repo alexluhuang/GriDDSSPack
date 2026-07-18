@@ -34,6 +34,13 @@
 #include "gridpack/utilities/results_exporter.hpp"
 #include "gridpack/math/linear_solver_backend.hpp"
 #include "ca_driver.hpp"
+#include "ca_async_writer.hpp"
+#ifdef GRIDPACK_WITH_CUDSS
+#include "gridpack/applications/modules/powerflow/pf_batch_ca.hpp"
+#include "gridpack/applications/modules/powerflow/pf_batch_ca_assembler.hpp"
+#include "gridpack/applications/modules/powerflow/pf_screen.hpp"
+#endif
+#include <map>
 
 #include <boost/scoped_ptr.hpp>
 #include <sstream>
@@ -416,6 +423,15 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   cursor->get("outputFormat", &outputFormat);
   std::string outputFile = "ca_results";
   cursor->get("outputFile", &outputFile);
+  // Phase-5 I/O overlap: when true, per-contingency csv_flat rows are written by
+  // a background thread (a spare Grace core) so disk I/O overlaps the next
+  // solve.  Output is byte-identical to the synchronous default (single FIFO
+  // consumer, same row order); default false preserves exact behavior.
+  bool overlapIO = false;
+  {
+    std::string t;
+    if (cursor->get("overlapIO", &t)) { util.toLower(t); overlapIO = (t == "true"); }
+  }
   // Optional CSV allowlist (from_bus,to_bus,ckt). Empty -> emit all.
   std::string monitorBranchesFile;
   cursor->get("monitorBranchesFile", &monitorBranchesFile);
@@ -470,9 +486,26 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     gridpack::utility::Configuration::CursorPtr lscur =
       config->getCursor("Configuration.Powerflow.LinearSolver");
     if (lscur) lscur->get("Backend", &backendName);
+    // Is the batched wave engine requested?  If so we keep the DEFAULT backend on
+    // CPU sparse LU on purpose: the wave drives cuDSS directly (CuDSSBatchedSolver),
+    // so the one-time base powerflow and the non-batchable per-contingency tail
+    // should use fast CPU LU rather than a full cuDSS analyze+factor of the whole
+    // system.  On a large network the base solve on cuDSS alone costs ~20 s (vs a
+    // few seconds on KLU) -- pure fixed overhead that would sink the GPU wall.
+    bool batchedReq = false;
+    {
+      std::string bt;
+      if (gpucur && gpucur->get("batched", &bt)) {
+        util.toLower(bt);
+        batchedReq = (bt == "true");
+      }
+    }
     gridpack::math::LinearSolverBackend requested =
       gridpack::math::LinearSolverBackend::PETSc;
-    if (gpu_enabled ||
+    if (batchedReq && gridpack::math::cudssBackendAvailable()) {
+      // wave uses cuDSS directly; base + fallback stay on CPU LU
+      requested = gridpack::math::LinearSolverBackend::PETSc;
+    } else if (gpu_enabled ||
         gridpack::math::linearSolverBackendFromString(backendName) ==
           gridpack::math::LinearSolverBackend::CuDSS) {
       requested = gridpack::math::LinearSolverBackend::CuDSS;
@@ -491,19 +524,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
                gridpack::math::linearSolverBackendName(actual));
       }
       // The Phase-2 batched contingency engine (many contingencies solved in
-      // one cuDSS batch, one shared symbolic analysis) is a separate,
-      // not-yet-enabled code path (see pf_batch_ca.hpp / GPU_CA_IMPLEMENTATION.md).
-      // The current GPU path accelerates each contingency's Newton solve
-      // individually (Phase 1).  Flag the request so the choice is explicit.
-      std::string tmp_batched;
-      if (gpucur && gpucur->get("batched", &tmp_batched)) {
-        util.toLower(tmp_batched);
-        if (tmp_batched == "true") {
-          printf("NOTE: <GPU><batched>true</batched> requested; the batched "
-                 "engine is not yet enabled -- using the per-contingency GPU "
-                 "solve (Phase 1).\n");
-        }
-      }
+      // one cuDSS batch, one shared symbolic analysis) is activated below, just
+      // before the contingency loop, once qlim/groupSize are known (it requires
+      // qlim=false and groupSize=1 so the per-bus structure is stable -- see
+      // pf_batch_ca_assembler.hpp).
     }
   }
   // Set static flag for PFBus class BEFORE network creation.
@@ -518,12 +542,16 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   boost::shared_ptr<gridpack::powerflow::PFNetwork>
     pf_network(new gridpack::powerflow::PFNetwork(task_comm));
   gridpack::powerflow::PFAppModule pf_app;
+  double _ts0 = MPI_Wtime();
+  bool _tsp = (std::getenv("GRIDPACK_BATCH_PROFILE") != NULL);
   // Read in the network from an external file and partition it over the
   // processors in the task communicator. This will read in power flow
   // parameters from the Powerflow block in the input
   pf_app.readNetwork(pf_network,config);
+  if (_tsp && world.rank()==0) fprintf(stderr,"[TS] readNetwork %.2fs\n", MPI_Wtime()-_ts0);
   // Finish initializing the network
   pf_app.initialize();
+  if (_tsp && world.rank()==0) fprintf(stderr,"[TS] initialize %.2fs\n", MPI_Wtime()-_ts0);
 
   // Build (number -> name) lookup tables for area, zone, owner.
   // Keyed on the PSS/E-assigned number (not contiguous), used when
@@ -633,12 +661,13 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // Per-rank streaming output file. Opened on first row written so non-csv_flat
   // runs and ranks that produce no rows leave nothing behind.
   std::string flatPartPath;
+  gridpack::contingency_analysis::AsyncRowWriter flatPart;
   if (outputFormat == "csv_flat") {
     std::ostringstream oss;
     oss << outputFile << "_flat." << world.rank() << ".part";
     flatPartPath = oss.str();
+    flatPart.open(flatPartPath, overlapIO);   // file created lazily on first row
   }
-  std::ofstream flatPart;
   size_t flatRowCount = 0;
 
   // (from, to, ckt) key shared by the monitor allowlist and base_cache.
@@ -854,10 +883,14 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     std::vector<std::string> v_strs = pf_app.writeBusString("vr_str");
     std::vector<std::string> b_strs = pf_app.writeBranchString("flow_str");
     if (!emit || task_comm.rank() != 0) return;
-    if (!flatPart.is_open()) {
-      flatPart.open(flatPartPath.c_str(), std::ios::out | std::ios::trunc);
-      flatPart << std::fixed;
-    }
+    // Buffer this contingency's rows into one block, then hand it to the writer
+    // (Phase-5 I/O overlap).  Formatted with snprintf into a preallocated string
+    // -- numerically identical to the old ostringstream(std::fixed) path but far
+    // cheaper per row, which matters when a wave emits millions of branch rows
+    // (the 24k-bus training network writes ~6M rows / >800 MB).
+    std::string frow;
+    frow.reserve(b_strs.size() * 100 + 64);
+    char lbuf[256];
     std::map<int, std::pair<double,double> > vbymag_ang;
     for (size_t vi = 0; vi < v_strs.size(); vi++) {
       int    bus_id = 0, use_vmag = 0, changed = 0;
@@ -911,21 +944,14 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       double ang_from_deg = (vf != vbymag_ang.end()) ? vf->second.second : 0.0;
       double v_to         = (vt != vbymag_ang.end()) ? vt->second.first  : 0.0;
       double ang_to_deg   = (vt != vbymag_ang.end()) ? vt->second.second : 0.0;
-      flatPart << event_idx << "," << ct_name << ","
-               << from << "," << to << "," << ckt << ","
-               << std::setprecision(4) << p << ","
-               << std::setprecision(4) << q << ","
-               << std::setprecision(4) << flow_mva << ","
-               << std::setprecision(4) << rate_sel << ","
-               << std::setprecision(2) << loading_pct << ","
-               << viol << ","
-               << std::setprecision(6) << v_from << ","
-               << std::setprecision(6) << v_to << ","
-               << std::setprecision(4) << ang_from_deg << ","
-               << std::setprecision(4) << ang_to_deg
-               << "\n";
+      int ln = snprintf(lbuf, sizeof(lbuf),
+          "%d,%s,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.2f,%d,%.6f,%.6f,%.4f,%.4f\n",
+          event_idx, ct_name, from, to, ckt, p, q, flow_mva, rate_sel,
+          loading_pct, viol, v_from, v_to, ang_from_deg, ang_to_deg);
+      if (ln > 0) frow.append(lbuf, static_cast<size_t>(ln < (int)sizeof(lbuf) ? ln : (int)sizeof(lbuf) - 1));
       flatRowCount++;
     }
+    flatPart.write(frow);         // enqueue this contingency's block
   };
 
   // Populate base_cache from current solved state. Called once after base
@@ -1152,6 +1178,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     world.barrier();
     MPI_Abort(static_cast<MPI_Comm>(world), 1);
   }
+  if (_tsp && world.rank()==0) fprintf(stderr,"[TS] baseSolve %.2fs\n", MPI_Wtime()-_ts0);
   // Suppress voltage violations already present at base.
   pf_app.ignoreVoltageViolations();
 
@@ -1477,6 +1504,108 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // Local contingency results storage for JSON/CSV export
   std::vector<gridpack::utility::ContingencyResult> localContingencies;
 
+  // ---------------------------------------------------------------------
+  // Phase-2 GPU batched contingency engine: state + activation.
+  // A wave of branch contingencies that leave every bus's PV/PQ/slack/isolated
+  // status unchanged share ONE cuDSS symbolic analysis and are refactorized +
+  // solved in batches on the GPU (pf_batch_ca.hpp / pf_batch_ca_assembler.hpp).
+  // It requires qlim=false and groupSize=1 (so the whole network is serial on a
+  // rank and the reduced-Jacobian structure is stable); everything else falls
+  // back to the exact per-contingency path.  Output is captured through the same
+  // code as the per-contingency loop, so all formats stay identical.
+  // ---------------------------------------------------------------------
+  std::map<int,int> batchIndexByTask;        // task_id -> index in the cuDSS batch
+  std::vector<char> batchConverged;          // per batched case
+  std::map<int, gridpack::utility::ConvergenceSummary> batchConvByTask;
+#ifdef GRIDPACK_WITH_CUDSS
+  boost::scoped_ptr<gridpack::powerflow::GridpackBatchAssembler> batchAsm;
+#endif
+  bool gpu_batched = false;
+  bool batchWarmStart = true;
+  {
+    std::string t;
+    gridpack::utility::Configuration::CursorPtr gcur =
+      config->getCursor("Configuration.Contingency_analysis.GPU");
+    if (gcur && gcur->get("batched", &t)) { util.toLower(t); gpu_batched = (t == "true"); }
+    t.clear();
+    if (gcur && gcur->get("warmStart", &t)) { util.toLower(t); batchWarmStart = (t != "false"); }
+  }
+  double batchTol = 1.0e-6;
+  int batchMaxIter = 50;
+  int batchRefactorEvery = 1;
+  bool batchConstantFactor = false;
+  double batchDamping = 1.0;
+  // Outer-loop controllers the batched inner Newton does NOT run; if any is on,
+  // the batched result would diverge from the per-contingency solve, so the
+  // batched engine must not engage (route to the correct per-contingency path).
+  bool pf_switchedShunt = false, pf_ltc = false, pf_areaInterchange = false;
+  {
+    gridpack::utility::Configuration::CursorPtr pcur =
+      config->getCursor("Configuration.Powerflow");
+    if (pcur) {
+      pcur->get("tolerance", &batchTol);
+      pcur->get("maxIteration", &batchMaxIter);
+      pcur->get("dampingFactor", &batchDamping);
+      std::string t;
+      if (pcur->get("SwitchedShunt", &t)) { util.toLower(t); pf_switchedShunt = (t == "true"); }
+      t.clear();
+      if (pcur->get("LTC", &t)) { util.toLower(t); pf_ltc = (t == "true"); }
+      t.clear();
+      if (pcur->get("AreaInterchange", &t)) { util.toLower(t); pf_areaInterchange = (t == "true"); }
+    }
+    gridpack::utility::Configuration::CursorPtr lcur =
+      config->getCursor("Configuration.Powerflow.LinearSolver");
+    if (lcur) {
+      lcur->get("refactorEvery", &batchRefactorEvery);
+      std::string cf;
+      if (lcur->get("constantFactor", &cf)) {
+        util.toLower(cf);
+        if (cf == "true") {
+          batchRefactorEvery = batchMaxIter;   // factor once
+          batchConstantFactor = true;          // engage the chord path in solveWave
+        }
+      }
+    }
+  }
+  // The batched wave drives cuDSS DIRECTLY (CuDSSBatchedSolver), so it only needs
+  // cuDSS to be built + a device present -- not the default backend to be cuDSS.
+  // In fact for the batched path the default backend is deliberately left on CPU
+  // LU (fast base solve + fallback); see the backend-selection block above.
+  bool cudssActive = gridpack::math::cudssBackendAvailable();
+  // The batched wave solves the inner Newton with the base PV/PQ status.  The
+  // outer-loop controllers with a per-case check hook (qlim, switched shunt,
+  // LTC) are handled AFTER the wave: any case a controller would act on is
+  // routed to the per-contingency fallback (the exact solve() with the full
+  // controller loop), so batched results match the CPU path within tolerance.
+  // qlim in particular touches only the handful of cases that actually hit a
+  // reactive limit.  Area interchange is an outermost slack-redistribution loop
+  // with no per-case check hook, so with it enabled the batch is disabled and
+  // every case uses the per-contingency GPU path (still correct, just not
+  // wave-accelerated).
+  bool useBatched = gpu_batched && cudssActive && (grp_size == 1) &&
+                    !pf_areaInterchange;
+  if (gpu_batched && world.rank() == 0) {
+    if (!cudssActive)
+      printf("NOTE: <GPU><batched> requested but cuDSS is unavailable (binary not "
+             "built with cuDSS or no CUDA device visible); using the CPU path.\n");
+    else if (grp_size != 1)
+      printf("NOTE: <GPU><batched> requested but groupSize=%d; the batched engine "
+             "requires groupSize=1. Using the per-contingency GPU path.\n", grp_size);
+    else if (pf_areaInterchange)
+      printf("NOTE: <GPU><batched> requested but AreaInterchange is enabled; the "
+             "batched wave has no per-case area-slack check, so every case uses "
+             "the per-contingency GPU path.\n");
+    else
+      printf("GPU batched contingency engine ENABLED "
+             "(tol=%.1e, maxIter=%d, solve=%s, warmStart=%s, damping=%.2f, "
+             "qlim=%s, shunt=%s, ltc=%s via post-wave fallback).\n",
+             batchTol, batchMaxIter,
+             batchConstantFactor ? "constant-factor/chord" : "exact-Newton",
+             batchWarmStart ? "true" : "false", batchDamping,
+             check_Qlim ? "on" : "off", pf_switchedShunt ? "on" : "off",
+             pf_ltc ? "on" : "off");
+  }
+
   // Convergence row recorder; indexes events[task_id].
   auto recordConv = [&](int task_id, const char *status,
                         const std::string &) {
@@ -1486,7 +1615,12 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     r.event_idx = task_id + 1;
     r.name      = events[task_id].p_name;
     r.type      = (events[task_id].p_type == Branch) ? "branch" : "generator";
-    r.cs        = pf_app.getConvergence();
+    // Batched cases skip pf_app.solve(), so pf_app.getConvergence() would be
+    // stale -- use the summary injected from the batched solve when present.
+    std::map<int, gridpack::utility::ConvergenceSummary>::const_iterator bci =
+      batchConvByTask.find(task_id);
+    r.cs        = (bci != batchConvByTask.end()) ? bci->second
+                                                 : pf_app.getConvergence();
     r.status    = status;
     localConvRows.push_back(r);
   };
@@ -1494,9 +1628,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // Evaluate contingencies using the task manager
   int task_id;
   char sbuf[128];
-  // nextTask returns the same task_id on all processors in task_comm. When the
-  // calculation runs out of task, nextTask will return false.
-  while (taskmgr.nextTask(task_comm, &task_id)) {
+  // The per-contingency work (reset, set contingency, solve or overlay a batched
+  // result, capture, restore) is one lambda so the CPU per-contingency loop and
+  // the GPU batched path drive IDENTICAL setup/capture/teardown.
+  auto runOneCase = [&](int task_id) {
     if (print_calcs) printf("Executing task %d on process %d\n",task_id,world.rank());
     // Trim trailing spaces from contingency name for filename
     std::string fname = events[task_id].p_name;
@@ -1553,6 +1688,21 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     // Skip power flow if contingency setup failed (no valid slack) or islanding detected
     bool slackCapacityOk = true;  // Will be checked after solve
     bool solveOk = false;
+#ifdef GRIDPACK_WITH_CUDSS
+    std::map<int,int>::iterator _bit = batchIndexByTask.find(task_id);
+    if (_bit != batchIndexByTask.end()) {
+      // Pre-solved by the GPU batch: overlay its converged state (the branch is
+      // already out of service from setContingency above, restoreSlack matched)
+      // rather than re-solving, so the capture below sees the batched solution.
+      batchAsm->applyCaseForOutput(_bit->second);
+      solveOk = (batchConverged[_bit->second] != 0);
+      // solve() was skipped, so inject the batched convergence summary; without
+      // this, collectResults() (json/csv) would copy a stale p_convergence.
+      std::map<int, gridpack::utility::ConvergenceSummary>::iterator _ci =
+        batchConvByTask.find(task_id);
+      if (_ci != batchConvByTask.end()) pf_app.setConvergence(_ci->second);
+    } else
+#endif
     if (contingencyFound && !islandDetected) {
       try {
         solveOk = pf_app.solve();
@@ -1853,11 +2003,169 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     gridpack::powerflow::PFBus::clearQlimWarnings();
     // Close output file for this contingency
     if (print_calcs) pf_app.close();
+  };  // end runOneCase
+
+#ifdef GRIDPACK_WITH_CUDSS
+  if (_tsp && world.rank()==0) fprintf(stderr,"[TS] preContingency %.2fs\n", MPI_Wtime()-_ts0);
+  if (useBatched) {
+    // Collect this task communicator's share of the contingencies, then run the
+    // branch-eligible subset as cuDSS batches (one shared symbolic analysis) and
+    // fall back to the per-contingency path for the rest.  Every case is finally
+    // driven through runOneCase so the captured output is identical.
+    std::vector<int> myTasks;
+    while (taskmgr.nextTask(task_comm, &task_id)) myTasks.push_back(task_id);
+
+    bool _bprof = (std::getenv("GRIDPACK_BATCH_PROFILE") != NULL);
+    double _bt0 = _bprof ? MPI_Wtime() : 0.0;
+    batchAsm.reset(new gridpack::powerflow::GridpackBatchAssembler(
+        pf_app, events, myTasks, batchWarmStart, batchDamping));
+    double _bt1 = _bprof ? MPI_Wtime() : 0.0;
+    batchAsm->prepare();
+    if (_bprof && world.rank() == 0) {
+      double _bt2 = MPI_Wtime();
+      fprintf(stderr, "[BATCH_SETUP] ctor=%.2fs prepare=%.2fs (cases=%d)\n",
+              _bt1 - _bt0, _bt2 - _bt1, batchAsm->caseCount());
+    }
+
+    // Phase-3: Union-Set connectivity pre-screen over the base in-service branch
+    // graph.  Reports how many single-branch outages disconnect the grid -- the
+    // fast (O(K*alpha(N))) analog of the per-case getIslandCount()/hasLoneBus()
+    // that prepare() uses authoritatively to route islanding cases to fallback.
+    // (It removes a whole bus-pair edge, so it is a conservative upper bound for
+    // multi-circuit branches; getIslandCount remains the per-circuit authority.)
+    if (world.rank() == 0) {
+      int nb = pf_network->numBuses();
+      std::vector<int> sf, st;
+      int nBranchLoc = pf_network->numBranches();
+      sf.reserve(nBranchLoc); st.reserve(nBranchLoc);
+      for (int bi = 0; bi < nBranchLoc; bi++) {
+        int b1 = 0, b2 = 0;
+        pf_network->getBranchEndpoints(bi, &b1, &b2);
+        sf.push_back(b1); st.push_back(b2);
+      }
+      gridpack::powerflow::N1ConnectivityScreen screen(nb, sf, st);
+      std::vector<int> comps = screen.screenAllBranchOutages();
+      int islanding = 0;
+      for (size_t e = 0; e < comps.size(); e++) if (comps[e] > 1) islanding++;
+      printf("[Phase-3 screen] Union-Set over %d branches: %d single-branch "
+             "outages island the grid\n", static_cast<int>(comps.size()),
+             islanding);
+    }
+
+    int Wbatch = batchAsm->caseCount();
+    if (Wbatch > 0) {
+      gridpack::powerflow::PFBatchNR nr(*batchAsm, batchTol, batchMaxIter,
+                                        batchRefactorEvery, batchConstantFactor);
+      const std::vector<gridpack::powerflow::BatchCaseStatus>& st = nr.solveWave();
+      batchConverged.assign(Wbatch, 0);
+      for (int k = 0; k < Wbatch; k++) {
+        int tid = batchAsm->batchTaskId(k);
+        batchIndexByTask[tid] = k;
+        batchConverged[k] = st[k].converged ? 1 : 0;
+        gridpack::utility::ConvergenceSummary cs;
+        cs.converged = st[k].converged;
+        cs.iterations = st[k].iterations;
+        cs.finalTolerance = st[k].mismatch;   // inf-norm ||PQ|| (same metric as solve)
+        // The batched engine tracks only the inf-norm mismatch, not the per-bus
+        // P/Q worst-bus split the per-contingency path records.  For a converged
+        // case all per-bus mismatches are < tol (~0); leave the worst-bus
+        // diagnostics 0 rather than mislabel the pu inf-norm as an MW P-mismatch.
+        cs.finalMismatch.maxPBus = 0;
+        cs.finalMismatch.maxPMismatch = 0.0;
+        cs.finalMismatch.maxQBus = 0;
+        cs.finalMismatch.maxQMismatch = 0.0;
+        batchConvByTask[tid] = cs;
+      }
+    }
+    if (world.rank() == 0) {
+      printf("[batched GPU] %d branch contingencies solved in the cuDSS batch "
+             "(1 shared symbolic analysis); %d routed to the per-contingency "
+             "path (generator/islanded/slack-transfer/structure-changed)\n",
+             Wbatch, static_cast<int>(batchAsm->nonBatchTaskIds().size()));
+    }
+
+    // Robustness: any case that did NOT converge inside the batched wave (e.g.
+    // a chord-Newton stall on an unusually large perturbation) is routed to the
+    // per-contingency solver, which uses exact Newton with line search.
+    if (Wbatch > 0) {
+      int nnc = 0;
+      for (int k = 0; k < Wbatch; k++) {
+        int tid = batchAsm->batchTaskId(k);
+        if (!batchConverged[k] && batchIndexByTask.count(tid)) {
+          batchIndexByTask.erase(tid);
+          batchConvByTask.erase(tid);
+          nnc++;
+        }
+      }
+      if (nnc && world.rank() == 0)
+        printf("[batched GPU] %d non-converged case(s) -> per-contingency "
+               "fallback\n", nnc);
+    }
+
+    // Post-wave controller fallback.  A batched case was solved with the base
+    // PV/PQ status and no outer-loop controller.  For each still-batched case,
+    // load its converged state and run the enabled controller checks
+    // (qlim/shunt/LTC); if any would act on the case, drop it from the batched
+    // overlay set so runOneCase() re-solves it with the full controller loop.
+    // qlim uses the fresh p_Qinj that applyCaseForOutput refreshes, so a case is
+    // only re-solved when a generator genuinely crosses a reactive limit (a
+    // handful on Texas7k); the 97% that never switch keep the batched result,
+    // which equals the CPU qlim result exactly (qlim never triggered there).
+    if (Wbatch > 0 && (check_Qlim || pf_switchedShunt || pf_ltc)) {
+      int nredo = 0;
+      for (int k = 0; k < Wbatch; k++) {
+        int tid = batchAsm->batchTaskId(k);
+        if (batchIndexByTask.find(tid) == batchIndexByTask.end()) continue;
+        batchAsm->applyCaseForOutput(k);   // load converged state + refresh Qinj
+        bool ok = true;
+        if (check_Qlim && !pf_app.checkQlimViolations()) ok = false;
+        if (ok && pf_switchedShunt && !pf_app.checkSwitchedShuntViolations())
+          ok = false;
+        if (ok && pf_ltc && !pf_app.checkLTCViolations()) ok = false;
+        batchAsm->clearCaseForOutput(k);   // restore branch topology
+        // Undo any PV/PQ / shunt / tap mutation the checks applied.
+        if (check_Qlim) pf_app.clearQlimViolations();
+        if (pf_switchedShunt) pf_app.clearSwitchedShunts();
+        if (pf_ltc) pf_app.clearLTCControls();
+        if (!ok) {
+          batchIndexByTask.erase(tid);     // -> runOneCase solves it with qlim
+          batchConvByTask.erase(tid);
+          nredo++;
+        }
+      }
+      if (world.rank() == 0)
+        printf("[batched GPU controllers] %d case(s) hit a qlim/shunt/LTC limit "
+               "-> re-solved on the per-contingency path with the full "
+               "controller loop\n", nredo);
+    }
+
+    // Capture every case (batched cases overlay their converged state inside
+    // runOneCase; the rest solve normally there).
+    //
+    // The batched wave ran on cuDSS directly (CuDSSBatchedSolver), independent of
+    // the default backend.  The cases runOneCase() still has to *solve* here are
+    // exactly the ones the batch could NOT take -- structure-changed / islanded /
+    // slack-transfer, non-converged, and qlim/shunt/LTC violators.  A single
+    // per-contingency cuDSS solve is ~3x slower than sparse CPU LU at this scale
+    // (fresh symbolic analysis + host<->device copies per controller pass), so on
+    // radial networks with a high non-batchable fraction that tail can make the
+    // GPU path slower than CPU.  Route those residual solves to the CPU LU
+    // backend; the batched cases below don't solve at all (they overlay their
+    // converged batch state), so this only touches the fallback tail.  Results are
+    // identical -- same Newton, different linear solver.
+    gridpack::math::setDefaultLinearSolverBackend(
+        gridpack::math::LinearSolverBackend::PETSc);
+    for (size_t ti = 0; ti < myTasks.size(); ti++) runOneCase(myTasks[ti]);
+  } else
+#endif
+  {
+    while (taskmgr.nextTask(task_comm, &task_id)) runOneCase(task_id);
   }
+  if (_tsp && world.rank()==0) fprintf(stderr,"[TS] contingencyDone %.2fs\n", MPI_Wtime()-_ts0);
   // csv_flat / csv_delta: each rank streamed rows to its .part file during
   // the loop. Close, sync, then world rank 0 writes header + concatenates.
   if (outputFormat == "csv_flat") {
-    if (flatPart.is_open()) flatPart.close();
+    flatPart.close();
   }
   if (outputFormat == "csv_delta") {
     if (deltaPart.is_open()) deltaPart.close();
@@ -2249,6 +2557,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     timer->stop(t_stats);
   }
   timer->stop(t_total);
+  if (_tsp && world.rank()==0) fprintf(stderr,"[TS] end %.2fs\n", MPI_Wtime()-_ts0);
   // If all processors executed at least one task, then print out timing
   // statistics (this printout does not work if some processors do not define
   // all timing variables)
