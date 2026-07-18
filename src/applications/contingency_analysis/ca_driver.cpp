@@ -32,6 +32,7 @@
 #include "gridpack/include/gridpack.hpp"
 #include "gridpack/applications/modules/powerflow/pf_app_module.hpp"
 #include "gridpack/utilities/results_exporter.hpp"
+#include "gridpack/math/linear_solver_backend.hpp"
 #include "ca_driver.hpp"
 
 #include <boost/scoped_ptr.hpp>
@@ -445,6 +446,65 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
              contingencyRating.c_str());
     }
     contingencyRating = "C";
+  }
+  // ---------------------------------------------------------------------
+  // GPU (NVIDIA cuDSS) linear-solver backend selection.  Pure opt-in: the GPU
+  // path is chosen only when input.xml requests it AND the binary was built
+  // with cuDSS AND a CUDA device is visible; otherwise the run uses the
+  // existing PETSc/direct-LU CPU path unchanged.  This must be set here, before
+  // any LinearSolver is constructed inside the power-flow solves.  The CLI
+  // (mpirun -n K ca.x input.xml) is unaffected.
+  // ---------------------------------------------------------------------
+  {
+    bool gpu_enabled = false;
+    std::string tmp_gpu;
+    gridpack::utility::Configuration::CursorPtr gpucur =
+      config->getCursor("Configuration.Contingency_analysis.GPU");
+    if (gpucur && gpucur->get("enabled", &tmp_gpu)) {
+      util.toLower(tmp_gpu);
+      gpu_enabled = (tmp_gpu == "true");
+    }
+    // A <Powerflow><LinearSolver><Backend>cudss</Backend> value also selects
+    // the GPU path.
+    std::string backendName;
+    gridpack::utility::Configuration::CursorPtr lscur =
+      config->getCursor("Configuration.Powerflow.LinearSolver");
+    if (lscur) lscur->get("Backend", &backendName);
+    gridpack::math::LinearSolverBackend requested =
+      gridpack::math::LinearSolverBackend::PETSc;
+    if (gpu_enabled ||
+        gridpack::math::linearSolverBackendFromString(backendName) ==
+          gridpack::math::LinearSolverBackend::CuDSS) {
+      requested = gridpack::math::LinearSolverBackend::CuDSS;
+    }
+    gridpack::math::setDefaultLinearSolverBackend(requested);
+    if (world.rank() == 0) {
+      gridpack::math::LinearSolverBackend actual =
+        gridpack::math::resolveLinearSolverBackend();
+      if (requested == gridpack::math::LinearSolverBackend::CuDSS &&
+          actual != gridpack::math::LinearSolverBackend::CuDSS) {
+        printf("GPU linear solver requested but unavailable "
+               "(binary not built with cuDSS or no CUDA device visible); "
+               "falling back to CPU PETSc backend.\n");
+      } else {
+        printf("Linear solver backend: %s\n",
+               gridpack::math::linearSolverBackendName(actual));
+      }
+      // The Phase-2 batched contingency engine (many contingencies solved in
+      // one cuDSS batch, one shared symbolic analysis) is a separate,
+      // not-yet-enabled code path (see pf_batch_ca.hpp / GPU_CA_IMPLEMENTATION.md).
+      // The current GPU path accelerates each contingency's Newton solve
+      // individually (Phase 1).  Flag the request so the choice is explicit.
+      std::string tmp_batched;
+      if (gpucur && gpucur->get("batched", &tmp_batched)) {
+        util.toLower(tmp_batched);
+        if (tmp_batched == "true") {
+          printf("NOTE: <GPU><batched>true</batched> requested; the batched "
+                 "engine is not yet enabled -- using the per-contingency GPU "
+                 "solve (Phase 1).\n");
+        }
+      }
+    }
   }
   // Set static flag for PFBus class BEFORE network creation.
   // This controls how Q values are reported in output functions:

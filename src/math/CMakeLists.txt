@@ -25,6 +25,7 @@ set(target_libraries
 list(APPEND gridpack_math_sources
   vector_implementation.cpp
   implementation_visitor.cpp
+  linear_solver_backend.cpp
   )
 
 # implementation independent math header files
@@ -44,6 +45,7 @@ set(gridpack_math_headers
   linear_solver.hpp
   linear_solver_implementation.hpp
   linear_solver_interface.hpp
+  linear_solver_backend.hpp
   math.hpp
   matrix.hpp
   matrix_implementation.hpp
@@ -133,11 +135,45 @@ else()
 endif()
 
 # -------------------------------------------------------------
+# NVIDIA cuDSS GPU direct-solver backend (opt-in, header-only class +
+# runtime backend-selection layer).  The -DGRIDPACK_WITH_CUDSS definition
+# is added globally in the top-level CMakeLists.txt; here we only need the
+# cuDSS/CUDA include directories on the math library.  The
+# cudss_linear_solver_implementation.hpp header is included (guarded) from
+# petsc/petsc_linear_solver.cpp, so no additional source file is required.
+# -------------------------------------------------------------
+if (GRIDPACK_WITH_CUDSS)
+  set(gridpack_cudss_headers
+    cudss/cudss_exception.hpp
+    cudss/cudss_csr_extractor.hpp
+    cudss/cudss_linear_solver_implementation.hpp
+    cudss/cudss_batched_solver.hpp
+    )
+endif()
+
+# -------------------------------------------------------------
 # gridpack math library
 # -------------------------------------------------------------
 add_library(gridpack_math
   ${gridpack_math_sources}
   )
+
+if (GRIDPACK_WITH_CUDSS)
+  # cudss (imported target) carries its own include dirs; CUDA::cudart
+  # provides cuda_runtime.h.  Link them PUBLIC so downstream apps that pull
+  # in the guarded headers also get the include paths.
+  target_link_libraries(gridpack_math PUBLIC ${GRIDPACK_CUDSS_LIBRARIES})
+
+  # Standalone check of the Phase-2 batched cuDSS solver (verifies a batched
+  # solve of many same-pattern systems against known solutions on the GPU).
+  add_executable(cudss_batched_test test/cudss_batched_test.cpp)
+  target_link_libraries(cudss_batched_test gridpack_math ${target_libraries})
+
+  # Standalone check of the Phase-2 batched Newton engine (PFBatchNR): a wave of
+  # nonlinear cases converged to known roots via the cuDSS batch path.
+  add_executable(pf_batch_ca_test test/pf_batch_ca_test.cpp)
+  target_link_libraries(pf_batch_ca_test gridpack_math ${target_libraries})
+endif()
 
 gridpack_set_library_version(gridpack_math)
 add_dependencies(gridpack_math external_build)
@@ -363,10 +399,17 @@ target_link_libraries(bouncing_ball_test gridpack_math ${target_libraries})
 # -------------------------------------------------------------
 # installation
 # -------------------------------------------------------------
-install(FILES 
+install(FILES
   ${gridpack_math_headers}
   DESTINATION include/gridpack/math
   )
+
+if (GRIDPACK_WITH_CUDSS)
+  install(FILES
+    ${gridpack_cudss_headers}
+    DESTINATION include/gridpack/math/cudss
+    )
+endif()
 
 install(TARGETS 
   gridpack_math

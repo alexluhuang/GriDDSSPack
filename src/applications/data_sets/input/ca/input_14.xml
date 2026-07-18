@@ -14,6 +14,19 @@
     <qlim>true</qlim>
     <outputFormat>csv</outputFormat>
     <outputFile>ca_IEEE14</outputFile>
+    <!-- ================================================================== -->
+    <!-- Optional GPU acceleration (NVIDIA cuDSS). Default: disabled, which  -->
+    <!-- reproduces the CPU PETSc/direct-LU path exactly. Requires a build   -->
+    <!-- with GRIDPACK_WITH_CUDSS=ON and a visible CUDA device; otherwise    -->
+    <!-- CA silently falls back to the CPU path. See GPU_CA_IMPLEMENTATION.md -->
+    <!-- ================================================================== -->
+    <GPU>
+      <enabled>false</enabled>       <!-- master opt-in switch; default false -->
+      <batched>false</batched>       <!-- Phase 2 batched engine (per rank)   -->
+      <waveSize>auto</waveSize>      <!-- 'auto' => cuDSS memory-prediction    -->
+      <screen>true</screen>          <!-- Phase 3 connectivity/DC pre-pass     -->
+      <fastDecoupled>false</fastDecoupled> <!-- Phase 4 FDPF throughput mode   -->
+    </GPU>
   </Contingency_analysis>
   <Powerflow>
     <networkConfiguration>IEEE14_ca.raw</networkConfiguration>
@@ -21,6 +34,9 @@
     <tolerance>1.0e-6</tolerance>
     <qlim>true</qlim>
     <LinearSolver>
+      <!-- Backend: 'petsc' (default, CPU direct LU) | 'cudss' (GPU direct LU).
+           The <GPU><enabled> master switch above also selects cudss. -->
+      <Backend>petsc</Backend>
       <PETScPrefix>pre_</PETScPrefix>
       <PETScOptions>
         -ksp_type richardson

@@ -68,6 +68,16 @@ add_custom_command(
   )
 
 add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/input_14_gpu.xml"
+  COMMAND ${CMAKE_COMMAND}
+  -D INPUT:PATH="${GRIDPACK_DATA_DIR}/input/ca/input_14_gpu.xml"
+  -D OUTPUT:PATH="${CMAKE_CURRENT_BINARY_DIR}/input_14_gpu.xml"
+  -D PKG:STRING="${GRIDPACK_MATSOLVER_PKG}"
+  -P "${PROJECT_SOURCE_DIR}/cmake-modules/set_lu_solver_pkg.cmake"
+  DEPENDS "${GRIDPACK_DATA_DIR}/input/ca/input_14_gpu.xml"
+  )
+
+add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/input_118.xml"
   COMMAND ${CMAKE_COMMAND}
   -D INPUT:PATH="${GRIDPACK_DATA_DIR}/input/ca/input_118.xml"
@@ -136,6 +146,7 @@ add_custom_command(
 add_custom_target(ca.x.input
   DEPENDS
   ${CMAKE_CURRENT_BINARY_DIR}/input_14.xml
+  ${CMAKE_CURRENT_BINARY_DIR}/input_14_gpu.xml
   ${CMAKE_CURRENT_BINARY_DIR}/input_14_auto_n1.xml
   ${CMAKE_CURRENT_BINARY_DIR}/input_14_qlim.xml
   ${CMAKE_CURRENT_BINARY_DIR}/input_118.xml
@@ -155,6 +166,7 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.install.in
 install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/CMakeLists.txt
   ${CMAKE_CURRENT_BINARY_DIR}/input_14.xml
+  ${CMAKE_CURRENT_BINARY_DIR}/input_14_gpu.xml
   ${CMAKE_CURRENT_BINARY_DIR}/input_14_auto_n1.xml
   ${CMAKE_CURRENT_BINARY_DIR}/input_14_qlim.xml
   ${GRIDPACK_DATA_DIR}/raw/IEEE14_ca.raw

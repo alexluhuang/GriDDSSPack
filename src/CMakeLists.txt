@@ -109,6 +109,19 @@ option(BUILD_SHARED_LIBS
 option(ENABLE_ENVIRONMENT_FROM_COMM
   "Create GridPACK environment from communicator" OFF)
 
+# -------------------------------------------------------------
+# NVIDIA cuDSS GPU direct-solver backend (opt-in at build time).
+#
+# When ON, a cuDSS-based LinearSolverImplementation is compiled INTO the
+# single set of GridPACK binaries (e.g. ca.x) alongside the existing
+# PETSc/KLU path.  Whether cuDSS is actually *used* is a runtime decision
+# driven by input.xml (see LinearSolver/Backend and Contingency_analysis/GPU),
+# and the code silently falls back to the PETSc path when cuDSS is compiled
+# out or no CUDA device is visible.  See GPU_CA_IMPLEMENTATION.md.
+# -------------------------------------------------------------
+option(GRIDPACK_WITH_CUDSS
+  "Compile the NVIDIA cuDSS GPU direct-solver backend into GridPACK" OFF)
+
 
 # turn testing on/off
 option(GRIDPACK_ENABLE_TESTS "Enable build of unit tests" ON)
@@ -377,6 +390,45 @@ elseif (PETSC_HAVE_MUMPS)
 else()
   set(GRIDPACK_MATSOLVER_PKG "petsc")
   message(WARNING "Installed PETSc does not have a parallel direct solver, expect unit test failures")
+endif()
+
+# -------------------------------------------------------------
+# NVIDIA cuDSS (Direct Sparse Solver)
+#
+# Discover the CUDA toolkit runtime and the cuDSS library so the GPU
+# direct-LU backend can be compiled in.  Only the CUDA *runtime* API and
+# cuDSS host API are needed (no device kernels are compiled for the
+# Phase-1 backend), so we do NOT enable the CUDA language here -- the
+# backend is plain C++ linked against CUDA::cudart and cudss.
+#
+# cuDSS ships a CMake package config (cudss-config.cmake).  Point CMake at
+# it with -D cudss_DIR=<prefix>/lib/cmake/cudss (or set CUDSS_DIR).  On the
+# DGX Spark / GB10 the target architecture is sm_121; ship PTX as a hedge.
+# -------------------------------------------------------------
+if (GRIDPACK_WITH_CUDSS)
+  message(STATUS "Checking for CUDA toolkit and cuDSS ...")
+
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "Found CUDA toolkit ${CUDAToolkit_VERSION}")
+
+  # Allow CUDSS_DIR (env or cache) as an alias for the cudss package location
+  if (DEFINED CUDSS_DIR AND NOT DEFINED cudss_DIR)
+    set(cudss_DIR "${CUDSS_DIR}/lib/cmake/cudss")
+  endif()
+  if (DEFINED ENV{CUDSS_DIR} AND NOT DEFINED cudss_DIR)
+    set(cudss_DIR "$ENV{CUDSS_DIR}/lib/cmake/cudss")
+  endif()
+
+  find_package(cudss CONFIG REQUIRED)
+  message(STATUS "Found cuDSS ${cudss_VERSION}")
+
+  # Propagate the feature macro to every translation unit so the guarded
+  # cuDSS code (and the runtime backend-selection layer) is enabled.
+  add_definitions(-DGRIDPACK_WITH_CUDSS)
+  set(GRIDPACK_CUDSS_LIBRARIES cudss CUDA::cudart)
+else()
+  message(STATUS "cuDSS GPU backend disabled (GRIDPACK_WITH_CUDSS=OFF)")
+  set(GRIDPACK_CUDSS_LIBRARIES)
 endif()
 
 # -------------------------------------------------------------
