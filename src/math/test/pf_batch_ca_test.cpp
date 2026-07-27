@@ -78,6 +78,52 @@ public:
     return std::max(std::fabs(f0), std::fabs(f1));
   }
 
+  // --- "live" per-case path (assembleLive == assemble here: the warm start is
+  // already in p_x[2k] and finishLive keeps it live). ---
+  double assembleLive(int k, double *jac, double *rhs)
+  {
+    return assemble(k, jac, rhs);
+  }
+
+  double updateLive(int k, const double *dx, double *jac, double *rhs)
+  {
+    p_x[2*k]   += dx[0];
+    p_x[2*k+1] += dx[1];
+    double x0 = p_x[2*k], x1 = p_x[2*k+1];
+    double f0 = x0*x0 + x1 - p_a[k];
+    double f1 = x0 + x1*x1 - p_b[k];
+    jac[0] = 2.0*x0; jac[1] = 1.0;
+    jac[2] = 1.0;    jac[3] = 2.0*x1;
+    rhs[0] = -f0;    rhs[1] = -f1;
+    return std::max(std::fabs(f0), std::fabs(f1));
+  }
+
+  void finishLive(int /*k*/) {}
+
+  // --- constant-factorization (chord) path: fixed Jacobian, RHS-only updates. ---
+  void assembleBaseJac(double *jac)
+  {
+    // Base Jacobian at the warm start x=(1,1): [[2,1],[1,2]].
+    jac[0] = 2.0; jac[1] = 1.0;
+    jac[2] = 1.0; jac[3] = 2.0;
+  }
+
+  double assembleLiveRhs(int k, double *rhs)
+  {
+    double x0 = p_x[2*k], x1 = p_x[2*k+1];
+    double f0 = x0*x0 + x1 - p_a[k];
+    double f1 = x0 + x1*x1 - p_b[k];
+    rhs[0] = -f0; rhs[1] = -f1;
+    return std::max(std::fabs(f0), std::fabs(f1));
+  }
+
+  double updateLiveRhs(int k, const double *dx, double *rhs)
+  {
+    p_x[2*k]   += dx[0];
+    p_x[2*k+1] += dx[1];
+    return assembleLiveRhs(k, rhs);
+  }
+
   // Max over cases of the final residual ||F_k(x_k)||_inf.  Each case has its
   // own (a_k,b_k), so a tiny residual for every case proves the batch solved W
   // DISTINCT nonlinear systems (not the same one W times).  (The system has

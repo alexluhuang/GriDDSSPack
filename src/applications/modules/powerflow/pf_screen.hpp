@@ -30,6 +30,7 @@
 #define _pf_screen_hpp_
 
 #include <vector>
+#include <algorithm>
 #include <numeric>
 
 #ifdef _OPENMP
@@ -90,18 +91,60 @@ public:
 
   /// Screen every branch outage; result[e] = component count with e removed.
   /**
-   * Independent per outage, so this is embarrassingly parallel; parallelized
-   * across the Grace cores with OpenMP when available.
+   * A single Tarjan bridge traversal classifies every N-1 outage in O(V+E).
+   * Edge IDs, rather than parent vertices, are used when walking the graph so
+   * parallel circuits are handled correctly: neither parallel edge is a bridge.
    */
   std::vector<int> screenAllBranchOutages(void) const
   {
     const int K = static_cast<int>(p_from.size());
-    std::vector<int> comps(K, 1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 64)
-#endif
+    std::vector<int> comps(K, 0);
+    std::vector<std::vector<Edge> > graph(p_nbus);
     for (int e = 0; e < K; ++e) {
-      comps[e] = componentsWithout(e);
+      const int u = p_from[e], v = p_to[e];
+      if (u < 0 || u >= p_nbus || v < 0 || v >= p_nbus || u == v) continue;
+      graph[u].push_back(Edge(v, e));
+      graph[v].push_back(Edge(u, e));
+    }
+
+    std::vector<int> discovery(p_nbus, -1), low(p_nbus, -1);
+    std::vector<int> parentVertex(p_nbus, -1), parentEdge(p_nbus, -1);
+    std::vector<char> bridge(K, 0);
+    int clock = 0;
+    int baseComponents = 0;
+    std::vector<Frame> stack;
+    stack.reserve(p_nbus);
+    for (int root = 0; root < p_nbus; ++root) {
+      if (discovery[root] >= 0) continue;
+      ++baseComponents;
+      discovery[root] = low[root] = clock++;
+      stack.push_back(Frame(root));
+      while (!stack.empty()) {
+        Frame& frame = stack.back();
+        const int u = frame.vertex;
+        if (frame.nextEdge < graph[u].size()) {
+          const Edge edge = graph[u][frame.nextEdge++];
+          if (edge.id == parentEdge[u]) continue;
+          if (discovery[edge.to] < 0) {
+            parentVertex[edge.to] = u;
+            parentEdge[edge.to] = edge.id;
+            discovery[edge.to] = low[edge.to] = clock++;
+            stack.push_back(Frame(edge.to));
+          } else {
+            low[u] = std::min(low[u], discovery[edge.to]);
+          }
+          continue;
+        }
+        stack.pop_back();
+        const int parent = parentVertex[u];
+        if (parent >= 0) {
+          low[parent] = std::min(low[parent], low[u]);
+          if (low[u] > discovery[parent]) bridge[parentEdge[u]] = 1;
+        }
+      }
+    }
+    for (int e = 0; e < K; ++e) {
+      comps[e] = baseComponents + (bridge[e] ? 1 : 0);
     }
     return comps;
   }
@@ -110,6 +153,18 @@ public:
   int numBranches(void) const { return static_cast<int>(p_from.size()); }
 
 private:
+
+  struct Edge {
+    int to;
+    int id;
+    Edge(int to_, int id_) : to(to_), id(id_) {}
+  };
+
+  struct Frame {
+    int vertex;
+    size_t nextEdge;
+    explicit Frame(int vertex_) : vertex(vertex_), nextEdge(0) {}
+  };
 
   int p_nbus;
   std::vector<int> p_from, p_to;

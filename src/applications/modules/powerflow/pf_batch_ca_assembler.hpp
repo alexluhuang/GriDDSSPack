@@ -36,6 +36,7 @@
 #ifdef GRIDPACK_WITH_CUDSS
 
 #include <vector>
+#include <map>
 #include <string>
 #include <utility>
 #include <cstdlib>
@@ -53,6 +54,7 @@
 
 #include "gridpack/applications/modules/powerflow/pf_app_module.hpp"
 #include "gridpack/applications/modules/powerflow/pf_batch_ca.hpp"
+#include "gridpack/applications/modules/powerflow/pf_screen.hpp"
 #include "gridpack/applications/components/pf_matrix/pf_components.hpp"
 #include "gridpack/mapper/full_map.hpp"
 #include "gridpack/mapper/bus_vector_map.hpp"
@@ -147,6 +149,7 @@ public:
     // Precompute the CSR scatter map (component block -> CSR slot) from the base
     // topology, which is exactly the fixed pattern extracted above.
     if (p_useFast) p_buildScatterMap();
+    p_buildConnectivityScreen();
   }
 
   ~GridpackBatchAssembler(void)
@@ -195,18 +198,33 @@ public:
           if (br) {
             BranchTog bt;
             bt.br = br; bt.tag = evt.p_ckt[i];
+            bt.localIndex = lids[j];
             bt.baseStatus = br->getBranchStatus(evt.p_ckt[i]);  // TRUE base status
             brs.push_back(bt);
           }
         }
       }
 
-      bool found = p_app.setContingency(evt);
       bool eligible = false;
-      if (found && p_app.getIslandCount() <= 1 && !p_app.hasLoneBus()) {
-        // Structure must be byte-for-byte identical to base (no PV<->PQ, no
-        // slack transfer) or the shared cuDSS analysis would be invalid.
-        if (p_structureSignature() == p_baseSig) eligible = true;
+      bool screened = false;
+      if (brs.size() == 1 && evt.p_to.size() == 1) {
+        const std::pair<int,std::string> key =
+          std::make_pair(brs[0].localIndex, brs[0].tag);
+        std::map<std::pair<int,std::string>, bool>::const_iterator pos =
+          p_lineIsBridge.find(key);
+        if (pos != p_lineIsBridge.end()) {
+          screened = true;
+          eligible = !pos->second;
+          ++p_screenSkipped;
+        }
+      }
+      if (!screened) {
+        bool found = p_app.setContingency(evt);
+        if (found && p_app.getIslandCount() <= 1 && !p_app.hasLoneBus() &&
+            p_structureSignature() == p_baseSig) {
+          eligible = true;
+        }
+        p_app.unSetContingency(evt);
       }
       if (eligible) {
         p_batchTaskIds.push_back(tid);
@@ -214,7 +232,6 @@ public:
       } else {
         p_nonBatchTaskIds.push_back(tid);
       }
-      p_app.unSetContingency(evt);
     }
 
     // Per-case iterate storage for the batch (initialised to the chosen start).
@@ -460,6 +477,33 @@ public:
   }
 
 private:
+
+  void p_buildConnectivityScreen(void)
+  {
+    std::vector<int> from, to;
+    std::vector<std::pair<int,std::string> > keys;
+    const int nbranch = p_net->numBranches();
+    for (int bi = 0; bi < nbranch; ++bi) {
+      PFBranch* branch =
+        dynamic_cast<PFBranch*>(p_net->getBranch(bi).get());
+      if (!branch) continue;
+      int u = -1, v = -1;
+      p_net->getBranchEndpoints(bi, &u, &v);
+      const std::vector<std::string> tags = branch->getLineIDs();
+      for (size_t j = 0; j < tags.size(); ++j) {
+        if (!branch->getBranchStatus(tags[j])) continue;
+        from.push_back(u);
+        to.push_back(v);
+        keys.push_back(std::make_pair(bi, tags[j]));
+      }
+    }
+    N1ConnectivityScreen screen(p_nbus, from, to);
+    const int baseComponents = screen.componentsWithout(-1);
+    const std::vector<int> outageComponents = screen.screenAllBranchOutages();
+    for (size_t e = 0; e < keys.size(); ++e) {
+      p_lineIsBridge[keys[e]] = outageComponents[e] > baseComponents;
+    }
+  }
 
   // --- per-bus structure signature (matches how the mapper sizes the system)
   std::vector<int> p_structureSignature(void)
@@ -803,7 +847,12 @@ private:
   std::vector<char> p_isActiveBus;
 
   // A contingency branch to toggle, with its BASE status for correct restore.
-  struct BranchTog { PFBranch* br; std::string tag; bool baseStatus; };
+  struct BranchTog {
+    PFBranch* br;
+    std::string tag;
+    bool baseStatus;
+    int localIndex;
+  };
 
   // batchable cases
   std::vector<int> p_batchTaskIds;
@@ -812,6 +861,7 @@ private:
   // everything else -> driver runs it through the per-contingency path
   std::vector<int> p_nonBatchTaskIds;
   int p_screenSkipped;
+  std::map<std::pair<int,std::string>, bool> p_lineIsBridge;
 
   GridpackBatchAssembler(const GridpackBatchAssembler&);
   GridpackBatchAssembler& operator=(const GridpackBatchAssembler&);

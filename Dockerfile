@@ -165,6 +165,7 @@ RUN cmake -Wdev -D GA_DIR:STRING=${ga_gp_dir} \
     -D GRIDPACK_WITH_CUDSS:BOOL=ON \
     -D cudss_DIR:PATH="${cudss_DIR}" \
     -D CMAKE_CUDA_ARCHITECTURES:STRING="${cuda_arch}" \
+    -D GRIDPACK_ENABLE_TESTS:BOOL=OFF \
     -D BUILD_SHARED_LIBS=true \
     ..
 RUN make install
