@@ -6,8 +6,9 @@
   GRIDPACK_WITH_CUDSS=ON and a visible CUDA device; otherwise CA silently falls
   back to the CPU PETSc path and the results are unchanged.
 
-  Invocation is identical to the CPU case:
-      mpirun -n 1 ca.x input_14_gpu.xml
+  Every rank independently claims fixed waves of eight from the shared task
+  stream and uses its own cuDSS context:
+      mpirun -n 20 ca.x input_14_gpu.xml
 
   The three output CSVs (_delta/_flat, _buses, _convergence) are byte-for-byte
   the same as the CPU run (to FP64 round-off, after the documented event_idx
@@ -26,8 +27,8 @@
     <outputFile>ca_IEEE14_gpu</outputFile>
     <GPU>
       <enabled>true</enabled>        <!-- master opt-in switch -->
-      <batched>false</batched>       <!-- Phase 1 per-contingency drop-in solve -->
-      <waveSize>auto</waveSize>
+      <batched>true</batched>        <!-- every rank claims independent waves -->
+      <waveSize>8</waveSize>
       <screen>true</screen>
       <fastDecoupled>false</fastDecoupled>
       <!-- cuDSS numerical tunables (iterativeRefinement, deterministic,
@@ -43,6 +44,7 @@
       <!-- Route the Newton-Raphson linear solve through cuDSS. When the GPU
            is unavailable the code falls back to the PETScOptions path below. -->
       <Backend>cudss</Backend>
+      <constantFactor>true</constantFactor>
       <!-- cuDSS tunables (all optional):
            iterativeRefinement: gate mixed-precision IR behind a residual check
            deterministic:       reproducible (bit-wise) factorization, slower

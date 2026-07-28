@@ -250,6 +250,10 @@ add_executable(numeric_test test/numeric_test.cpp)
 target_link_libraries(numeric_test ${GLIBC_LIBS})
 gridpack_add_serial_unit_test(numeric numeric_test)
 
+add_executable(pf_screen_test test/pf_screen_test.cpp)
+target_link_libraries(pf_screen_test ${GLIBC_LIBS})
+gridpack_add_serial_unit_test(pf_screen pf_screen_test)
+
 
 # -------------------------------------------------------------
 # vector test suite
@@ -415,4 +419,3 @@ install(TARGETS
   gridpack_math
   DESTINATION lib
   )
-

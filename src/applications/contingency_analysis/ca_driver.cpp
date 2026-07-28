@@ -38,7 +38,6 @@
 #ifdef GRIDPACK_WITH_CUDSS
 #include "gridpack/applications/modules/powerflow/pf_batch_ca.hpp"
 #include "gridpack/applications/modules/powerflow/pf_batch_ca_assembler.hpp"
-#include "gridpack/applications/modules/powerflow/pf_screen.hpp"
 #endif
 #include <map>
 
@@ -51,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <set>
 
 // Statistical-summary output (vmag.txt, pflow.txt, etc.) used to be controlled
@@ -418,8 +418,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // Check for Q limit violations (qlim: true=enabled, false=disabled)
   bool check_Qlim = cursor->get("qlim", true);
   double qlim_deadband = cursor->get("qlimDeadband", 0.1);
-  // Output format: "json", "csv", or "text" (default)
-  std::string outputFormat = "text";
+  // Exhaustive per-(contingency, branch) rows are the default contract.
+  std::string outputFormat = "csv_flat";
   cursor->get("outputFormat", &outputFormat);
   std::string outputFile = "ca_results";
   cursor->get("outputFile", &outputFile);
@@ -428,9 +428,21 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // solve.  Output is byte-identical to the synchronous default (single FIFO
   // consumer, same row order); default false preserves exact behavior.
   bool overlapIO = false;
+  bool sharedFlatFile = true;
+  bool bufferFlatOutput = false;
   {
     std::string t;
     if (cursor->get("overlapIO", &t)) { util.toLower(t); overlapIO = (t == "true"); }
+    t.clear();
+    if (cursor->get("sharedFlatFile", &t)) {
+      util.toLower(t);
+      sharedFlatFile = (t != "false");
+    }
+    t.clear();
+    if (cursor->get("bufferFlatOutput", &t)) {
+      util.toLower(t);
+      bufferFlatOutput = (t == "true");
+    }
   }
   // Optional CSV allowlist (from_bus,to_bus,ckt). Empty -> emit all.
   std::string monitorBranchesFile;
@@ -471,17 +483,17 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // any LinearSolver is constructed inside the power-flow solves.  The CLI
   // (mpirun -n K ca.x input.xml) is unaffected.
   // ---------------------------------------------------------------------
+  bool gpuEnabled = false;
   {
-    bool gpu_enabled = false;
     std::string tmp_gpu;
     gridpack::utility::Configuration::CursorPtr gpucur =
       config->getCursor("Configuration.Contingency_analysis.GPU");
     if (gpucur && gpucur->get("enabled", &tmp_gpu)) {
       util.toLower(tmp_gpu);
-      gpu_enabled = (tmp_gpu == "true");
+      gpuEnabled = (tmp_gpu == "true");
     }
-    // A <Powerflow><LinearSolver><Backend>cudss</Backend> value also selects
-    // the GPU path.
+    // The linear-solver backend is considered only after the explicit CA GPU
+    // switch is enabled.
     std::string backendName;
     gridpack::utility::Configuration::CursorPtr lscur =
       config->getCursor("Configuration.Powerflow.LinearSolver");
@@ -502,12 +514,11 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     }
     gridpack::math::LinearSolverBackend requested =
       gridpack::math::LinearSolverBackend::PETSc;
-    if (batchedReq && gridpack::math::cudssBackendAvailable()) {
+    if (gpuEnabled && batchedReq &&
+        gridpack::math::cudssBackendAvailable()) {
       // wave uses cuDSS directly; base + fallback stay on CPU LU
       requested = gridpack::math::LinearSolverBackend::PETSc;
-    } else if (gpu_enabled ||
-        gridpack::math::linearSolverBackendFromString(backendName) ==
-          gridpack::math::LinearSolverBackend::CuDSS) {
+    } else if (gpuEnabled) {
       requested = gridpack::math::LinearSolverBackend::CuDSS;
     }
     gridpack::math::setDefaultLinearSolverBackend(requested);
@@ -542,6 +553,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   boost::shared_ptr<gridpack::powerflow::PFNetwork>
     pf_network(new gridpack::powerflow::PFNetwork(task_comm));
   gridpack::powerflow::PFAppModule pf_app;
+  pf_app.suppressOutput(!print_calcs);
   double _ts0 = MPI_Wtime();
   bool _tsp = (std::getenv("GRIDPACK_BATCH_PROFILE") != NULL);
   // Read in the network from an external file and partition it over the
@@ -662,13 +674,38 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // runs and ranks that produce no rows leave nothing behind.
   std::string flatPartPath;
   gridpack::contingency_analysis::AsyncRowWriter flatPart;
+  const char* flatHeader =
+    "event_idx,contingency,from_bus,to_bus,circuit_id,"
+    "p_from_mw,q_from_mvar,mva_from,rate_mva,loading_percent,"
+    "viol,v_from_pu,v_to_pu,ang_from_deg,ang_to_deg\n";
   if (outputFormat == "csv_flat") {
-    std::ostringstream oss;
-    oss << outputFile << "_flat." << world.rank() << ".part";
-    flatPartPath = oss.str();
-    flatPart.open(flatPartPath, overlapIO);   // file created lazily on first row
+    if (bufferFlatOutput) {
+      // Finalized with disjoint MPI-IO writes after the contingency loop.
+    } else if (sharedFlatFile) {
+      flatPartPath = outputFile + "_flat.csv";
+      if (world.rank() == 0) {
+        std::ofstream flatOutput(flatPartPath.c_str(),
+            std::ios::out | std::ios::trunc | std::ios::binary);
+        flatOutput << flatHeader;
+      }
+      world.sync();
+      flatPart.open(flatPartPath, overlapIO, true);
+    } else {
+      std::ostringstream oss;
+      oss << outputFile << "_flat." << world.rank() << ".part";
+      flatPartPath = oss.str();
+      flatPart.open(flatPartPath, overlapIO);
+    }
   }
   size_t flatRowCount = 0;
+  std::string flatMemory;
+  auto writeFlatBlock = [&](const std::string& block) {
+    if (bufferFlatOutput) {
+      flatMemory.append(block);
+    } else {
+      flatPart.write(block);
+    }
+  };
 
   // (from, to, ckt) key shared by the monitor allowlist and base_cache.
   struct BranchKey {
@@ -880,6 +917,97 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // task_comm members short-circuit after the collective.
   auto captureFlatRows = [&](int event_idx, const std::string &name,
                              bool emit, bool is_base) {
+    if (task_comm.size() == 1 && !std::getenv("GRIDPACK_FLAT_LEGACY")) {
+      if (!emit) return;
+      std::string frow;
+      frow.reserve(static_cast<size_t>(pf_network->numBranches()) * 160);
+      char lbuf[256];
+      char ct_name[24];
+      std::strncpy(ct_name, name.c_str(), sizeof(ct_name) - 1);
+      ct_name[sizeof(ct_name) - 1] = '\0';
+      const double radiansToDegrees = 180.0 / (4.0 * std::atan(1.0));
+      const int nbranch = pf_network->numBranches();
+      for (int bi = 0; bi < nbranch; ++bi) {
+        gridpack::powerflow::PFBranch* branch =
+          dynamic_cast<gridpack::powerflow::PFBranch*>(
+              pf_network->getBranch(bi).get());
+        if (!branch) continue;
+        int fromLocal = -1, toLocal = -1;
+        pf_network->getBranchEndpoints(bi, &fromLocal, &toLocal);
+        gridpack::powerflow::PFBus* fromBus =
+          dynamic_cast<gridpack::powerflow::PFBus*>(
+              pf_network->getBus(fromLocal).get());
+        gridpack::powerflow::PFBus* toBus =
+          dynamic_cast<gridpack::powerflow::PFBus*>(
+              pf_network->getBus(toLocal).get());
+        if (!fromBus || !toBus) continue;
+        const int from = branch->getBus1OriginalIndex();
+        const int to = branch->getBus2OriginalIndex();
+        double vFrom = 0.0, aFrom = 0.0, vTo = 0.0, aTo = 0.0;
+        fromBus->getVoltageState(vFrom, aFrom);
+        toBus->getVoltageState(vTo, aTo);
+        aFrom *= radiansToDegrees;
+        aTo *= radiansToDegrees;
+        const std::vector<std::string> tags = branch->getLineIDs();
+        for (size_t li = 0; li < tags.size(); ++li) {
+          std::string ckt = tags[li];
+          while (!ckt.empty() && ckt[ckt.size() - 1] == ' ') ckt.resize(ckt.size() - 1);
+          while (!ckt.empty() && ckt[0] == ' ') ckt.erase(0, 1);
+          BranchKey mk;
+          mk.from = from;
+          mk.to = to;
+          mk.ckt = ckt;
+          if (!monitorSet.empty() && monitorSet.find(mk) == monitorSet.end()) continue;
+          if (haveAreaKvFilter) {
+            std::map<int, BusMeta>::const_iterator mf = bus_meta.find(from);
+            std::map<int, BusMeta>::const_iterator mt = bus_meta.find(to);
+            const int af = (mf != bus_meta.end()) ? mf->second.area : 0;
+            const int at = (mt != bus_meta.end()) ? mt->second.area : 0;
+            const double kf = (mf != bus_meta.end()) ? mf->second.basekv : 0.0;
+            const double kt = (mt != bus_meta.end()) ? mt->second.basekv : 0.0;
+            if (!passesAreaKv(af, at, kf, kt)) continue;
+          }
+          gridpack::ComplexType power = branch->getComplexPower(tags[li]);
+          double p = real(power), q = imag(power);
+          if (!branch->getBranchStatus(tags[li]) ||
+              fromBus->isIsolated() || toBus->isIsolated()) {
+            p = 0.0;
+            q = 0.0;
+          }
+          const double rateA = branch->getBranchRatingA(tags[li]);
+          double rateSelected = rateA;
+          if (!is_base) {
+            if (contingencyRating == "B") {
+              rateSelected = branch->getBranchRatingB(tags[li]);
+              if (rateSelected <= 0.0) rateSelected = rateA;
+            } else if (contingencyRating == "C") {
+              rateSelected = branch->getBranchRatingC(tags[li]);
+              if (rateSelected <= 0.0) {
+                rateSelected = branch->getBranchRatingB(tags[li]);
+                if (rateSelected <= 0.0) rateSelected = rateA;
+              }
+            }
+          }
+          const double flowMva = std::sqrt(p * p + q * q);
+          const double loading = rateSelected > 0.0 ?
+            100.0 * flowMva / rateSelected : 0.0;
+          const int viol = rateA > 0.0 && flowMva / rateA > 1.0 ? 1 : 0;
+          const int ln = std::snprintf(lbuf, sizeof(lbuf),
+              "%d,%s,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.2f,%d,"
+              "%.6f,%.6f,%.4f,%.4f\n",
+              event_idx, ct_name, from, to, ckt.c_str(), p, q, flowMva,
+              rateSelected, loading, viol, vFrom, vTo, aFrom, aTo);
+          if (ln > 0) {
+            frow.append(lbuf, static_cast<size_t>(
+                ln < static_cast<int>(sizeof(lbuf)) ?
+                ln : static_cast<int>(sizeof(lbuf)) - 1));
+          }
+          ++flatRowCount;
+        }
+      }
+      writeFlatBlock(frow);
+      return;
+    }
     std::vector<std::string> v_strs = pf_app.writeBusString("vr_str");
     std::vector<std::string> b_strs = pf_app.writeBranchString("flow_str");
     if (!emit || task_comm.rank() != 0) return;
@@ -951,7 +1079,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       if (ln > 0) frow.append(lbuf, static_cast<size_t>(ln < (int)sizeof(lbuf) ? ln : (int)sizeof(lbuf) - 1));
       flatRowCount++;
     }
-    flatPart.write(frow);         // enqueue this contingency's block
+    writeFlatBlock(frow);
   };
 
   // Populate base_cache from current solved state. Called once after base
@@ -1522,6 +1650,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 #endif
   bool gpu_batched = false;
   bool batchWarmStart = true;
+  bool batchConnectivityScreen = true;
+  int batchWaveSize = 0;
   {
     std::string t;
     gridpack::utility::Configuration::CursorPtr gcur =
@@ -1529,6 +1659,16 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     if (gcur && gcur->get("batched", &t)) { util.toLower(t); gpu_batched = (t == "true"); }
     t.clear();
     if (gcur && gcur->get("warmStart", &t)) { util.toLower(t); batchWarmStart = (t != "false"); }
+    t.clear();
+    if (gcur && gcur->get("screen", &t)) {
+      util.toLower(t);
+      batchConnectivityScreen = (t != "false");
+    }
+    t.clear();
+    if (gcur && gcur->get("waveSize", &t)) {
+      util.toLower(t);
+      if (t != "auto") batchWaveSize = std::max(0, std::atoi(t.c_str()));
+    }
   }
   double batchTol = 1.0e-6;
   int batchMaxIter = 50;
@@ -1582,10 +1722,19 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // with no per-case check hook, so with it enabled the batch is disabled and
   // every case uses the per-contingency GPU path (still correct, just not
   // wave-accelerated).
-  bool useBatched = gpu_batched && cudssActive && (grp_size == 1) &&
+  bool useBatched = gpuEnabled && gpu_batched && cudssActive &&
+                    (grp_size == 1) &&
                     !pf_areaInterchange;
+  if (useBatched && batchWaveSize == 0) {
+    // Keep every rank's reservation small so all ranks return frequently to
+    // the shared dynamic task queue.
+    batchWaveSize = 8;
+  }
   if (gpu_batched && world.rank() == 0) {
-    if (!cudssActive)
+    if (!gpuEnabled)
+      printf("NOTE: <GPU><batched> is ignored because <GPU><enabled> is not "
+             "true; using the CPU path.\n");
+    else if (!cudssActive)
       printf("NOTE: <GPU><batched> requested but cuDSS is unavailable (binary not "
              "built with cuDSS or no CUDA device visible); using the CPU path.\n");
     else if (grp_size != 1)
@@ -1596,9 +1745,11 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
              "batched wave has no per-case area-slack check, so every case uses "
              "the per-contingency GPU path.\n");
     else
-      printf("GPU batched contingency engine ENABLED "
+      printf("GPU batched contingency engine ENABLED on all %d rank(s), "
+             "waveSize=%d "
              "(tol=%.1e, maxIter=%d, solve=%s, warmStart=%s, damping=%.2f, "
              "qlim=%s, shunt=%s, ltc=%s via post-wave fallback).\n",
+             world.size(), batchWaveSize,
              batchTol, batchMaxIter,
              batchConstantFactor ? "constant-factor/chord" : "exact-Newton",
              batchWarmStart ? "true" : "false", batchDamping,
@@ -2008,17 +2159,39 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 #ifdef GRIDPACK_WITH_CUDSS
   if (_tsp && world.rank()==0) fprintf(stderr,"[TS] preContingency %.2fs\n", MPI_Wtime()-_ts0);
   if (useBatched) {
+    unsigned long long localGpuWaves = 0;
+    unsigned long long localInspectedTasks = 0;
+    unsigned long long localEligibleTasks = 0;
+    unsigned long long localDirectFallbackTasks = 0;
+    unsigned long long localNonConvergedTasks = 0;
+    unsigned long long localControllerFallbackTasks = 0;
+    for (;;) {
     // Collect this task communicator's share of the contingencies, then run the
     // branch-eligible subset as cuDSS batches (one shared symbolic analysis) and
     // fall back to the per-contingency path for the rest.  Every case is finally
     // driven through runOneCase so the captured output is identical.
     std::vector<int> myTasks;
-    while (taskmgr.nextTask(task_comm, &task_id)) myTasks.push_back(task_id);
+    bool noMoreTasks = false;
+    while (batchWaveSize <= 0 ||
+           static_cast<int>(myTasks.size()) < batchWaveSize) {
+      if (taskmgr.nextTask(task_comm, &task_id)) {
+        myTasks.push_back(task_id);
+      } else {
+        noMoreTasks = true;
+        break;
+      }
+    }
+    if (myTasks.empty()) break;
+    ++localGpuWaves;
+    localInspectedTasks += static_cast<unsigned long long>(myTasks.size());
+    batchIndexByTask.clear();
+    batchConvByTask.clear();
 
     bool _bprof = (std::getenv("GRIDPACK_BATCH_PROFILE") != NULL);
     double _bt0 = _bprof ? MPI_Wtime() : 0.0;
     batchAsm.reset(new gridpack::powerflow::GridpackBatchAssembler(
-        pf_app, events, myTasks, batchWarmStart, batchDamping));
+        pf_app, events, myTasks, batchWarmStart, batchDamping,
+        batchConnectivityScreen));
     double _bt1 = _bprof ? MPI_Wtime() : 0.0;
     batchAsm->prepare();
     if (_bprof && world.rank() == 0) {
@@ -2027,32 +2200,16 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
               _bt1 - _bt0, _bt2 - _bt1, batchAsm->caseCount());
     }
 
-    // Phase-3: Union-Set connectivity pre-screen over the base in-service branch
-    // graph.  Reports how many single-branch outages disconnect the grid -- the
-    // fast (O(K*alpha(N))) analog of the per-case getIslandCount()/hasLoneBus()
-    // that prepare() uses authoritatively to route islanding cases to fallback.
-    // (It removes a whole bus-pair edge, so it is a conservative upper bound for
-    // multi-circuit branches; getIslandCount remains the per-circuit authority.)
-    if (world.rank() == 0) {
-      int nb = pf_network->numBuses();
-      std::vector<int> sf, st;
-      int nBranchLoc = pf_network->numBranches();
-      sf.reserve(nBranchLoc); st.reserve(nBranchLoc);
-      for (int bi = 0; bi < nBranchLoc; bi++) {
-        int b1 = 0, b2 = 0;
-        pf_network->getBranchEndpoints(bi, &b1, &b2);
-        sf.push_back(b1); st.push_back(b2);
-      }
-      gridpack::powerflow::N1ConnectivityScreen screen(nb, sf, st);
-      std::vector<int> comps = screen.screenAllBranchOutages();
-      int islanding = 0;
-      for (size_t e = 0; e < comps.size(); e++) if (comps[e] > 1) islanding++;
-      printf("[Phase-3 screen] Union-Set over %d branches: %d single-branch "
-             "outages island the grid\n", static_cast<int>(comps.size()),
-             islanding);
+    if (world.rank() == 0 && batchConnectivityScreen) {
+      printf("[connectivity screen] linear-time bridge pass: %d islanding "
+             "line outage(s), %d per-case topology check(s) avoided\n",
+             batchAsm->bridgeCount(), batchAsm->screenSkipped());
     }
 
     int Wbatch = batchAsm->caseCount();
+    localEligibleTasks += static_cast<unsigned long long>(Wbatch);
+    localDirectFallbackTasks += static_cast<unsigned long long>(
+        batchAsm->nonBatchTaskIds().size());
     if (Wbatch > 0) {
       gridpack::powerflow::PFBatchNR nr(*batchAsm, batchTol, batchMaxIter,
                                         batchRefactorEvery, batchConstantFactor);
@@ -2100,6 +2257,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       if (nnc && world.rank() == 0)
         printf("[batched GPU] %d non-converged case(s) -> per-contingency "
                "fallback\n", nnc);
+      localNonConvergedTasks += static_cast<unsigned long long>(nnc);
     }
 
     // Post-wave controller fallback.  A batched case was solved with the base
@@ -2137,6 +2295,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         printf("[batched GPU controllers] %d case(s) hit a qlim/shunt/LTC limit "
                "-> re-solved on the per-contingency path with the full "
                "controller loop\n", nredo);
+      localControllerFallbackTasks +=
+        static_cast<unsigned long long>(nredo);
     }
 
     // Capture every case (batched cases overlay their converged state inside
@@ -2156,6 +2316,31 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     gridpack::math::setDefaultLinearSolverBackend(
         gridpack::math::LinearSolverBackend::PETSc);
     for (size_t ti = 0; ti < myTasks.size(); ti++) runOneCase(myTasks[ti]);
+    if (noMoreTasks) break;
+    }
+
+    unsigned long long localGpuCounts[6] = {
+      localGpuWaves,
+      localInspectedTasks,
+      localEligibleTasks,
+      localDirectFallbackTasks,
+      localNonConvergedTasks,
+      localControllerFallbackTasks
+    };
+    unsigned long long globalGpuCounts[6] = {0, 0, 0, 0, 0, 0};
+    MPI_Reduce(localGpuCounts, globalGpuCounts, 6, MPI_UNSIGNED_LONG_LONG,
+               MPI_SUM, 0, static_cast<MPI_Comm>(world));
+    if (world.rank() == 0) {
+      const unsigned long long retained =
+        globalGpuCounts[2] - globalGpuCounts[4] - globalGpuCounts[5];
+      printf("[GPU all-rank summary] ranks=%d waveSize=%d waves=%llu "
+             "inspected=%llu eligible=%llu direct_fallback=%llu "
+             "nonconverged_fallback=%llu controller_fallback=%llu "
+             "retained_gpu=%llu\n",
+             world.size(), batchWaveSize, globalGpuCounts[0],
+             globalGpuCounts[1], globalGpuCounts[2], globalGpuCounts[3],
+             globalGpuCounts[4], globalGpuCounts[5], retained);
+    }
   } else
 #endif
   {
@@ -2165,7 +2350,51 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // csv_flat / csv_delta: each rank streamed rows to its .part file during
   // the loop. Close, sync, then world rank 0 writes header + concatenates.
   if (outputFormat == "csv_flat") {
-    flatPart.close();
+    if (bufferFlatOutput) {
+      const unsigned long long localBytes =
+        static_cast<unsigned long long>(flatMemory.size());
+      std::vector<unsigned long long> bytes(world.size(), 0);
+      MPI_Allgather(&localBytes, 1, MPI_UNSIGNED_LONG_LONG, &bytes[0], 1,
+                    MPI_UNSIGNED_LONG_LONG, static_cast<MPI_Comm>(world));
+      const MPI_Offset headerBytes =
+        static_cast<MPI_Offset>(std::strlen(flatHeader));
+      MPI_Offset offset = headerBytes;
+      MPI_Offset totalBytes = headerBytes;
+      for (int rank = 0; rank < world.size(); ++rank) {
+        if (rank < world.rank()) offset += static_cast<MPI_Offset>(bytes[rank]);
+        totalBytes += static_cast<MPI_Offset>(bytes[rank]);
+      }
+      const std::string flatOutputPath = outputFile + "_flat.csv";
+      MPI_File file = MPI_FILE_NULL;
+      MPI_File_open(static_cast<MPI_Comm>(world),
+                    const_cast<char*>(flatOutputPath.c_str()),
+                    MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &file);
+      MPI_File_set_size(file, totalBytes);
+      if (world.rank() == 0) {
+        MPI_File_write_at(file, 0, const_cast<char*>(flatHeader),
+                          static_cast<int>(headerBytes), MPI_CHAR,
+                          MPI_STATUS_IGNORE);
+      }
+      MPI_Barrier(static_cast<MPI_Comm>(world));
+      size_t written = 0;
+      while (written < flatMemory.size()) {
+        const size_t remaining = flatMemory.size() - written;
+        const int chunk = static_cast<int>(
+            std::min(remaining, static_cast<size_t>(INT_MAX)));
+        MPI_File_write_at(file, offset + static_cast<MPI_Offset>(written),
+                          &flatMemory[written], chunk, MPI_CHAR,
+                          MPI_STATUS_IGNORE);
+        written += static_cast<size_t>(chunk);
+      }
+      MPI_File_close(&file);
+      flatMemory.clear();
+    } else {
+      flatPart.close();
+    }
+  }
+  long totalFlatRows = static_cast<long>(flatRowCount);
+  if (outputFormat == "csv_flat") {
+    world.sum(&totalFlatRows, 1);
   }
   if (outputFormat == "csv_delta") {
     if (deltaPart.is_open()) deltaPart.close();
@@ -2206,13 +2435,15 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         printf("[%s] wrote %zu rows to %s\n", tag, rows, outFile.c_str());
       };
 
-      if (outputFormat == "csv_flat") {
+      if (outputFormat == "csv_flat" && !sharedFlatFile &&
+          !bufferFlatOutput) {
         concatParts("_flat.",
-                    "event_idx,contingency,from_bus,to_bus,circuit_id,"
-                    "p_from_mw,q_from_mvar,mva_from,rate_mva,loading_percent,"
-                    "viol,v_from_pu,v_to_pu,ang_from_deg,ang_to_deg\n",
+                    flatHeader,
                     "csv_flat",
                     "_flat.csv");
+      } else if (outputFormat == "csv_flat") {
+        printf("[csv_flat] wrote %ld rows to %s_flat.csv\n",
+               totalFlatRows, outputFile.c_str());
       }
       if (outputFormat == "csv_delta") {
         concatParts("_delta.",
@@ -2565,4 +2796,3 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     timer->dump();
   }
 }
-

@@ -83,7 +83,8 @@ public:
   GridpackBatchAssembler(PFAppModule& app,
                          std::vector<Contingency>& events,
                          const std::vector<int>& taskIds,
-                         bool warmStart, double damping = 1.0)
+                         bool warmStart, double damping = 1.0,
+                         bool connectivityScreen = true)
     : p_app(app),
       p_net(app.getNetwork()),
       p_factory(app.getFactory()),
@@ -93,7 +94,8 @@ public:
       p_damping(damping),
       p_tRestore(0), p_tYbus(0), p_tMapJ(0), p_tCsr(0), p_tMapV(0),
       p_tRhs(0), p_tUpd(0), p_tSnap(0), p_nAsm(0), p_nUpd(0),
-      p_useFast(true)
+      p_useFast(true), p_screenEnabled(connectivityScreen),
+      p_screenBridgeCount(0)
   {
     // Opt out of the fast assembler (fall back to the GA mapper) for A/B
     // validation via GRIDPACK_BATCH_NOFAST=1.
@@ -149,7 +151,7 @@ public:
     // Precompute the CSR scatter map (component block -> CSR slot) from the base
     // topology, which is exactly the fixed pattern extracted above.
     if (p_useFast) p_buildScatterMap();
-    p_buildConnectivityScreen();
+    if (p_screenEnabled) p_buildConnectivityScreen();
   }
 
   ~GridpackBatchAssembler(void)
@@ -179,8 +181,6 @@ public:
       Contingency& evt = p_events[tid];
       // Only pure branch outages can share the base pattern.
       if (evt.p_type != Branch) { p_nonBatchTaskIds.push_back(tid); continue; }
-
-      p_restoreStart();                    // clean voltages for the classification
 
       // Cache the branch pointers + their BASE in-service status.  CRITICAL:
       // capture baseStatus BEFORE setContingency toggles the branch out --
@@ -219,6 +219,7 @@ public:
         }
       }
       if (!screened) {
+        p_restoreStart();
         bool found = p_app.setContingency(evt);
         if (found && p_app.getIslandCount() <= 1 && !p_app.hasLoneBus() &&
             p_structureSignature() == p_baseSig) {
@@ -450,6 +451,7 @@ public:
   int batchTaskId(int k) const { return p_batchTaskIds[k]; }
   const std::vector<int>& nonBatchTaskIds(void) const { return p_nonBatchTaskIds; }
   int screenSkipped(void) const { return p_screenSkipped; }
+  int bridgeCount(void) const { return p_screenBridgeCount; }
 
   /// Put the network into batched case @c k's converged state + topology so the
   /// driver's writeBusString/writeBranchString capture the right numbers.
@@ -501,7 +503,9 @@ private:
     const int baseComponents = screen.componentsWithout(-1);
     const std::vector<int> outageComponents = screen.screenAllBranchOutages();
     for (size_t e = 0; e < keys.size(); ++e) {
-      p_lineIsBridge[keys[e]] = outageComponents[e] > baseComponents;
+      const bool bridge = outageComponents[e] > baseComponents;
+      p_lineIsBridge[keys[e]] = bridge;
+      if (bridge) ++p_screenBridgeCount;
     }
   }
 
@@ -861,6 +865,8 @@ private:
   // everything else -> driver runs it through the per-contingency path
   std::vector<int> p_nonBatchTaskIds;
   int p_screenSkipped;
+  bool p_screenEnabled;
+  int p_screenBridgeCount;
   std::map<std::pair<int,std::string>, bool> p_lineIsBridge;
 
   GridpackBatchAssembler(const GridpackBatchAssembler&);

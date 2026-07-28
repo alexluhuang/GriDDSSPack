@@ -40,7 +40,7 @@ When combined, duplicates from the file are automatically skipped.
 | `minVoltage` | Minimum voltage threshold for violations (p.u.) | 0.9 |
 | `maxVoltage` | Maximum voltage threshold for violations (p.u.) | 1.1 |
 | `qlim` | Enable reactive power limit enforcement (PV to PQ bus conversion) | false |
-| `outputFormat` | `text` / `json` / `csv` / `csv_flat` / `csv_delta` | `text` |
+| `outputFormat` | `text` / `json` / `csv` / `csv_flat` / `csv_delta` | `csv_flat` |
 | `outputFile` | Base name for output files | `ca_results` |
 | `writeStats` | Emit StatBlock summary files (vmag.txt etc.). Set false to skip and avoid the per-case StatBlock work | true |
 | `contingencyRating` | Which PSS/E rating drives `cont_rate_mva` / `cont_loading_pct`: `A`, `B`, or `C` (with A→B→C fallback if missing). `base_rate_mva` always uses rate-A | `C` |
@@ -48,6 +48,38 @@ When combined, duplicates from the file are automatically skipped.
 | `monitorAreas` | Space-separated list of PSS/E area numbers. Branch is emitted if **either endpoint** is in the set | (unset) |
 | `monitorKvMin` | Lower kV threshold; branch passes if `max(kv_from, kv_to) >= monitorKvMin` | 0 (unbounded) |
 | `monitorKvMax` | Upper kV threshold; branch passes if `max(kv_from, kv_to) <= monitorKvMax` | 0 (unbounded) |
+
+### Opt-in GPU execution
+
+GPU execution is disabled unless the contingency-analysis `GPU` block contains
+`enabled=true`. Setting `Powerflow/LinearSolver/Backend` to `cudss` by itself
+does not enable CA GPU execution.
+
+```xml
+<Contingency_analysis>
+  <GPU>
+    <enabled>true</enabled>
+    <batched>true</batched>
+    <waveSize>auto</waveSize>
+    <warmStart>true</warmStart>
+    <screen>true</screen>
+  </GPU>
+</Contingency_analysis>
+```
+
+`batched=true` sends eligible branch outages through the cuDSS wave engine;
+generator, islanding, structure-changing, controller-action, and
+non-converged cases retain the CPU fallback. `waveSize=auto` uses eight cases
+per rank. Every rank claims and classifies independent waves from the shared
+dynamic task queue, so the ranks collectively inspect the complete contingency
+stream without a dedicated GPU-owner rank.
+`screen=true` enables the linear-time bridge pre-pass that identifies
+disconnecting single-line outages without a topology traversal per case.
+
+For `csv_flat`, `sharedFlatFile=true` (the default) lets ranks append complete
+case blocks to one file while computation continues. `bufferFlatOutput=true`
+instead buffers rank output and performs disjoint MPI-IO writes at the end; it
+uses more memory and is opt-in.
 
 ### Filtering csv_flat / csv_delta output
 
@@ -86,11 +118,10 @@ sample monitor file `monitor_branches_14.csv` in the same directory.
 
 ### Output ordering
 
-Rows are not sorted by contingency. The driver distributes contingencies
-across MPI ranks and streams each rank's results to its own `.part` file;
-rank 0 concatenates in rank order, so the final file is grouped by rank
-and ordered by completion within each rank. Column 1 (`event_idx`)
-preserves input-deck order — sort downstream if needed:
+Rows are not sorted by contingency. The driver dynamically distributes
+contingencies across MPI ranks and streams complete case blocks to the shared
+flat file. Column 1 (`event_idx`) preserves input-deck order — sort downstream
+if needed:
 
 ```bash
 ( head -1 my_run_delta.csv && tail -n +2 my_run_delta.csv | sort -t, -k1,1n ) > my_run_delta.sorted.csv
@@ -185,7 +216,7 @@ each row is self-contained (no separate base-case join needed).
 
 **`<outputFile>_flat.csv`** *(`outputFormat=csv_flat` only)* — long-form,
 one row per (case, branch). Columns: `event_idx, contingency, from_bus,
-to_bus, ckt, p_from_mw, q_from_mvar, mva_from, rate_mva, loading_percent,
+to_bus, circuit_id, p_from_mw, q_from_mvar, mva_from, rate_mva, loading_percent,
 viol, v_from_pu, v_to_pu, ang_from_deg, ang_to_deg`. `rate_mva` is rate-A
 on `event_idx=0` rows, the configured `contingencyRating` on contingency
 rows.

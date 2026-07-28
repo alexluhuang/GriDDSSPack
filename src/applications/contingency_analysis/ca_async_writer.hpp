@@ -44,7 +44,8 @@ class AsyncRowWriter
 public:
 
   AsyncRowWriter(void)
-    : p_async(false), p_started(false), p_stop(false), p_wrote(false)
+    : p_async(false), p_append(false), p_started(false), p_stop(false),
+      p_wrote(false)
   {}
 
   ~AsyncRowWriter(void)
@@ -55,10 +56,11 @@ public:
   /// Bind to a path.  @c async selects the background-writer (overlap) mode.
   /// The file is created lazily on the first non-empty block, so ranks that
   /// emit nothing leave no file behind (matching the prior behavior).
-  void open(const std::string& path, bool async)
+  void open(const std::string& path, bool async, bool append = false)
   {
     p_path = path;
     p_async = async;
+    p_append = append;
     if (p_async) {
       p_stop = false;
       p_thread = std::thread(&AsyncRowWriter::p_run, this);
@@ -106,7 +108,9 @@ private:
   void p_ensureFile(void)
   {
     if (!p_file.is_open()) {
-      p_file.open(p_path.c_str(), std::ios::out | std::ios::trunc);
+      const std::ios::openmode mode = std::ios::out | std::ios::binary |
+        (p_append ? std::ios::app : std::ios::trunc);
+      p_file.open(p_path.c_str(), mode);
     }
   }
 
@@ -132,6 +136,7 @@ private:
 
   std::string p_path;
   bool p_async;
+  bool p_append;
   bool p_started;
   bool p_stop;
   bool p_wrote;

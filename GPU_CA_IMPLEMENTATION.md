@@ -19,6 +19,83 @@ Everything here respects the architecture's hard constraints:
 
 ---
 
+## Full Texas7k acceptance result (2026-07-27)
+
+All acceptance runs used `mpirun -n 20`, 8,160 branch plus 731 generator
+contingencies, qlim enabled, and the complete 15-column `csv_flat` output.
+Each optimized run produced 78,969,601 lines. The stock image produced
+8,697,686,857 bytes but omitted parallel-circuit rows that the direct formatter
+now retains.
+
+| Mode | Full-run wall times (s) | Median (s) |
+|------|--------------------------|-----------:|
+| `pnnl/gridpack:ca-scalability-v2` CPU | 217.70 | 217.70 |
+| optimized CPU, GPU disabled | 90.76, 93.06, 93.34 | 93.06 |
+| opt-in GPU, rank-0 waves only | 91.75, 92.28, 96.51 | 92.28 |
+| opt-in GPU, all 20 ranks, wave 8/rank | **86.26** | **86.26** |
+
+The all-rank GPU path is therefore 2.52x faster than the stock image, 7.31%
+faster than the optimized 20-rank CPU median, and 6.52% faster than the former
+rank-0-only GPU median on the DGX Spark GB10.
+
+Every MPI rank now claims its own fixed eight-task waves from the shared dynamic
+task queue, classifies every claimed task, and creates its own cuDSS context.
+No dedicated GPU-owner rank exists. The final reduced accounting proves that
+the ranks collectively inspect all 8,891 tasks.
+
+| GPU ranks | Wall time (s) | Waves | Inspected | Initially eligible | Retained GPU |
+|----------:|--------------:|------:|----------:|-------------------:|-------------:|
+| 1 | 1108.70 | 1112 | 8891 | 7099 | 6497 |
+| 4 | 317.59 | 1112 | 8891 | 7099 | 6462 |
+| 8 | 167.45 | 1112 | 8891 | 7099 | 6467 |
+| 16 | 98.08 | 1114 | 8891 | 7099 | 6458 |
+| 20 | **86.26** | 1112 | 8891 | 7099 | 6388 |
+
+All five runs used wave size 8 per rank and produced the complete 78,969,601
+line flat output. The small retained-count variation comes from FP64/cuDSS
+round-off near the chord/controller fallback thresholds; every rejected result
+is re-solved by exact CPU Newton.
+
+### Full training.raw N-1, 20 ranks (2026-07-27)
+
+A matched all-rank GPU/CPU comparison used the 25,001-bus `training.raw`,
+32,229 generated branch contingencies, 4,834 generated generator
+contingencies, qlim enabled, and complete unfiltered `csv_flat` output:
+
+| Mode | Wall time (s) | Flat rows | File bytes |
+|------|--------------:|----------:|-----------:|
+| 20 CPU ranks, PETSc/KLU | 1347.82 | 1,004,156,806 | 114,403,438,927 |
+| 20 GPU ranks, wave 8/rank | **1299.79** | 1,004,221,268 | 114,410,878,595 |
+
+The all-rank GPU path is 48.03 seconds (3.56%, 1.037x) faster end-to-end.
+Its reduced accounting reported 4,633 waves, all 37,063 tasks inspected,
+21,291 initially GPU-eligible, 15,772 direct CPU fallbacks, 1,580 chord
+fallbacks, 2,108 controller fallbacks, and 17,603 retained GPU results.
+
+Both complete files passed a 15-field scan with zero malformed rows. Their row
+counts are not identical: nine events have different discrete convergence
+metadata. Seven are island-handling converged-flag differences, and two are
+`OK` on GPU versus `SLACK_OVERLOAD` on CPU. Those two cases account for 64,458
+of the 64,462 additional GPU rows (two times 32,229 branch circuits).
+
+This full all-rank result supersedes the earlier inference from a single-rank,
+64-contingency training measurement. Multiple CUDA contexts do contend for the
+GB10, but the measured contention is smaller than the benefit from exposing
+all eligible waves to cuDSS, reusing one numeric factorization per chord solve,
+offloading KLU work from the CPU cores/memory subsystem, and dynamically
+balancing eight-task reservations across all ranks.
+
+Earlier rank-0-only experiments at wave 4, 32, and 256 measured 95.17, 94.60,
+and 113.70 seconds. Those values describe the superseded dedicated-rank
+scheduler, not the all-rank design.
+
+The large-sweep implementation also uses a linear-time Tarjan bridge screen,
+direct component-to-CSR assembly, direct schema-preserving flat-row formatting,
+and shared append output. GPU use remains explicitly opt-in through
+`Contingency_analysis/GPU/enabled=true`; `outputFormat` defaults to `csv_flat`.
+
+---
+
 ## FINAL RESULTS (batched engine wired end-to-end, qlim ON)
 
 > This section supersedes the phase-by-phase notes below, which are kept for
@@ -29,8 +106,8 @@ Everything here respects the architecture's hard constraints:
 
 ### Architecture as shipped
 
-The GPU contingency path is a **sequential wave of branch-N-1 cases** that share
-the base reduced-Jacobian sparsity pattern:
+Every rank independently processes **sequential waves of eight branch-N-1
+cases** that share the base reduced-Jacobian sparsity pattern:
 
 1. **GA-free fast assembler** (`pf_batch_ca_assembler.hpp`). A one-time scatter
    map (component block → CSR slot) is precomputed from the base pattern; each
@@ -132,7 +209,7 @@ run.
 | **1b** | Route CA's linear solve through cuDSS when opted-in; per-contingency drop-in | **Implemented; IEEE-14 N-1 parity verified on GB10** |
 | **2 (core)** | Batched cuDSS multi-system solver — one symbolic analysis, W systems via the cuDSS batch API | **Implemented + verified on GB10** (`cudss_batched_solver.hpp`, `cudss_batched_test`) |
 | **2 (engine)** | Batched Newton over a wave (shared analysis, per-case chord solve, warm-start) | **Implemented + wired into `ca_driver` + GB10-verified end-to-end** (`pf_batch_ca.hpp` + `GridpackBatchAssembler`); drives real contingency waves → Texas7k 256 N-1 **1.33× vs CPU, qlim on** (see FINAL RESULTS above) |
-| **3** | Union-Set N-1 connectivity pre-pass | **Implemented + verified** (`pf_screen.hpp`) |
+| **3** | Linear-time Tarjan bridge connectivity pre-pass | **Implemented + verified** (`pf_screen.hpp`, including parallel circuits and a 100,000-bus chain) |
 | **4** | Constant-factorization ("factor-once, solve-many") path | **Implemented + verified on GB10** (`refactorEvery`/`constantFactor` in the cuDSS backend) |
 | **5** | Overlapped bulk CSV write (async writer thread) | **Implemented + verified on GB10** (`ca_async_writer.hpp`, `<overlapIO>`) |
 | **6** | Determinism mode, mixed-precision IR, validation report | **Config knobs live; parity oracle shipped (status-aware for diverged cases)** |
@@ -266,8 +343,8 @@ precedent the architecture cites.
   engine (`PFBatchNR` + `BatchAssembler` seam): wave loop, batched refactor/solve,
   warm-start, per-case dropout.
 * `src/math/test/pf_batch_ca_test.cpp` — GB10 check of the batched engine.
-* `src/applications/modules/powerflow/pf_screen.hpp` — Phase-3 Union-Set N-1
-  connectivity pre-pass.
+* `src/applications/modules/powerflow/pf_screen.hpp` — Phase-3 linear-time
+  Tarjan bridge connectivity pre-pass.
 * `src/math/cudss/cudss_linear_solver_implementation.hpp` — Phase-4
   constant-factorization mode (`refactorEvery`/`constantFactor`).
 * `src/applications/contingency_analysis/ca_async_writer.hpp` +
