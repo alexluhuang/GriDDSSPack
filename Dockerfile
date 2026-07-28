@@ -33,6 +33,11 @@ ARG cudss_url=https://developer.download.nvidia.com/compute/cudss/redist/libcuds
 # GPU compute architecture(s).  121 == sm_121 (GB10 Blackwell).  Real code is
 # emitted for sm_121 and PTX is kept as a forward-compatible fallback.
 ARG cuda_arch=121
+ARG image_revision=ca-all-rank-wave8
+
+LABEL org.opencontainers.image.title="GriDSSPack contingency analysis" \
+      org.opencontainers.image.description="GridPACK CA with opt-in all-rank NVIDIA cuDSS waves and PETSc/KLU fallback" \
+      org.opencontainers.image.revision="${image_revision}"
 
 # Setup environment variables used throughout installation
 ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC GNUMAKEFLAGS=--no-print-directory
@@ -61,10 +66,10 @@ ENV DYLD_LIBRARY_PATH=${LD_LIBRARY_PATH}
 
 # Install required system packages
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends cmake make wget tzdata git gfortran build-essential pkg-config \
+    apt-get install -y --no-install-recommends ca-certificates cmake make wget tzdata git gfortran build-essential pkg-config \
     python3 python3-pip python3-venv python3-dev python-is-python3 \
     openmpi-bin openmpi-common openmpi-doc libopenmpi-dev && \
-    apt-get clean
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
 # Install NVIDIA cuDSS (Direct Sparse Solver) from the redistributable archive.
@@ -168,7 +173,7 @@ RUN cmake -Wdev -D GA_DIR:STRING=${ga_gp_dir} \
     -D GRIDPACK_ENABLE_TESTS:BOOL=OFF \
     -D BUILD_SHARED_LIBS=true \
     ..
-RUN make install
+RUN cmake --build . --target install --parallel 10
 
 # Install Python bindings
 WORKDIR ${GRIDPACK_ROOT_DIR}
@@ -187,3 +192,8 @@ RUN pyvnum=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.versi
 
 WORKDIR ${GRIDPACK_ROOT_DIR}/workspace
 ENV PATH=${GRIDPACK_INSTALL_DIR}/bin:${GRIDPACK_INSTALL_DIR}/local/bin:${PATH}
+
+# Keep the stock GridPACK interaction model: bind-mount a case directory and
+# invoke `mpirun -n K ca.x input.xml`. The directory is created by WORKDIR and
+# ca.x is installed on PATH above.
+CMD ["bash"]

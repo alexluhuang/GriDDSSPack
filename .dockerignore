@@ -3,3 +3,14 @@ external_dependencies
 /python/build
 /python/dist
 /python/gridpack_hadrec.egg-info
+/build
+/gpubuild
+/.cache
+/.pytest_cache
+**/__pycache__
+*.pyc
+*.part
+*_flat.csv
+*_delta.csv
+*_convergence.csv
+*_buses.csv
