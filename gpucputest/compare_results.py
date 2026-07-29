@@ -29,7 +29,7 @@ import dask.dataframe as dd  # noqa: E402
 
 
 DEFAULT_DATA_DIR = Path(
-    "/home/alh360/Documents/GriDSSPack_Docker_Container/verification_gpu_7k"
+    "/home/alh360/Documents/GriDSSPack_Docker_Container/verification_gpu_training"
 )
 
 FLAT_DTYPES = {
