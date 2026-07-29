@@ -53,6 +53,7 @@ See the [user manual](https://gridpack.readthedocs.io/en/latest/index.html) for 
 - Quick Guide (To do)
 
 ## Documentation
+- [GriDSSPack design history, theory, and performance report](GRIDDSSPACK_EVOLUTION_REPORT.md)
 - [Docker Usage Guide](https://gridpack.readthedocs.io/en/latest/Section2-Docker.html)
 - [CI/CD Pipeline](docs/markdown/CI-CD.md)
 - [User manual](https://gridpack.readthedocs.io/en/latest/index.html)
