@@ -106,6 +106,16 @@ TASK_RE = re.compile(r"Number of tasks on process\s+(\d+):\s+(\d+)")
 TOTAL_CONTINGENCIES_RE = re.compile(r"Total contingencies to analyze:\s*(\d+)")
 GPU_SUMMARY_RE = re.compile(r"\[GPU all-rank summary\]\s*(.*)")
 KEY_VALUE_RE = re.compile(r"([A-Za-z_]+)=([0-9]+)")
+PROFILE_SCHEMA_RE = re.compile(r"\[profiling\]\s+schema=([A-Za-z0-9_.-]+)")
+
+CA_V2_COMMON_PHASES = (
+    "CA: Configuration",
+    "CA: Model and Output Setup",
+    "CA: Base Case",
+    "CA: Contingency Setup",
+    "CA: Contingency Processing",
+    "CA: Result Finalization",
+)
 
 
 def scalar(value: Any) -> Any:
@@ -796,6 +806,7 @@ def parse_log(path: Path) -> dict[str, Any]:
     tasks: dict[str, int] = {}
     total_contingencies = None
     gpu_summary: dict[str, int] = {}
+    profiling_schema = None
     current_timer: str | None = None
 
     with path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -830,6 +841,9 @@ def parse_log(path: Path) -> dict[str, Any]:
                     key: int(value)
                     for key, value in KEY_VALUE_RE.findall(summary.group(1))
                 }
+            schema = PROFILE_SCHEMA_RE.search(line)
+            if schema:
+                profiling_schema = schema.group(1)
 
     task_values = list(tasks.values())
     task_stats: dict[str, Any] = {"by_rank": tasks}
@@ -858,12 +872,64 @@ def parse_log(path: Path) -> dict[str, Any]:
         "timers": timers,
         "tasks": task_stats,
         "gpu_summary": gpu_summary,
+        "profiling_schema": profiling_schema,
+    }
+
+
+def profile_phase_coverage(parsed_log: dict[str, Any]) -> dict[str, Any]:
+    """Account for the ca-v2 whole-run timer using its six disjoint phases."""
+    timers = parsed_log["timers"]
+    missing = [
+        name
+        for name in CA_V2_COMMON_PHASES
+        if timers.get(name, {}).get("average") is None
+    ]
+    total = timers.get("Total Application", {}).get("average")
+    phase_sum = (
+        sum(timers[name]["average"] for name in CA_V2_COMMON_PHASES)
+        if not missing
+        else None
+    )
+    residual = (
+        total - phase_sum
+        if total is not None and phase_sum is not None
+        else None
+    )
+    # CoarseTimer prints four decimal places. The total and each of the six
+    # phases may independently round by half a unit in the last printed place.
+    rounding_tolerance = 0.00005 * (len(CA_V2_COMMON_PHASES) + 1)
+    return {
+        "schema": parsed_log["profiling_schema"],
+        "complete": (
+            parsed_log["profiling_schema"] == "ca-v2"
+            and total is not None
+            and not missing
+        ),
+        "missing_common_phases": missing,
+        "total_average_seconds": total,
+        "common_phase_average_sum_seconds": phase_sum,
+        "unaccounted_average_seconds": residual,
+        "accounted_percent": (
+            percent(phase_sum, total)
+            if phase_sum is not None and total is not None
+            else None
+        ),
+        "printed_time_rounding_tolerance_seconds": rounding_tolerance,
+        "residual_within_printed_time_rounding": (
+            abs(residual) <= rounding_tolerance
+            if residual is not None
+            else None
+        ),
     }
 
 
 def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
     gpu = parse_log(gpu_log)
     cpu = parse_log(cpu_log)
+    matching_ca_v2 = (
+        gpu["profiling_schema"] == "ca-v2"
+        and cpu["profiling_schema"] == "ca-v2"
+    )
     timer_names = sorted(
         set(gpu["timers"]) | set(cpu["timers"]),
         key=lambda name: (name != "Total Application", name),
@@ -872,8 +938,42 @@ def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
     for name in timer_names:
         gpu_timer = gpu["timers"].get(name, {})
         cpu_timer = cpu["timers"].get(name, {})
+        if name == "Total Application":
+            comparison_scope = "cross-version total"
+            comparable = True
+            comparison_note = (
+                "Same CADriver::execute boundary in stock and ca-v2 profiles"
+            )
+        elif name in CA_V2_COMMON_PHASES:
+            comparison_scope = "ca-v2 common phase"
+            comparable = matching_ca_v2
+            comparison_note = (
+                "Identical non-overlapping ca-v2 phase boundary"
+                if comparable
+                else "Requires ca-v2 profiling schema in both logs"
+            )
+        elif name.startswith("CA GPU:"):
+            comparison_scope = "GPU diagnostic"
+            comparable = False
+            comparison_note = "GPU implementation detail; no CPU equivalent"
+        elif name.startswith("CA:"):
+            comparison_scope = "CA diagnostic"
+            comparable = False
+            comparison_note = (
+                "Useful within one implementation; workload may differ by path"
+            )
+        else:
+            comparison_scope = "legacy diagnostic"
+            comparable = False
+            comparison_note = (
+                "Legacy category is retained for compatibility but does not have "
+                "a path-independent scope"
+            )
         row: dict[str, Any] = {
             "timer": name,
+            "comparison_scope": comparison_scope,
+            "comparable": comparable,
+            "comparison_note": comparison_note,
             "gpu_average_seconds": gpu_timer.get("average"),
             "cpu_average_seconds": cpu_timer.get("average"),
             "gpu_maximum_seconds": gpu_timer.get("maximum"),
@@ -886,16 +986,27 @@ def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
             cpu_value = cpu_timer.get(statistic)
             row[f"{statistic}_speedup_cpu_over_gpu"] = (
                 ratio(cpu_value, gpu_value)
-                if gpu_value is not None and cpu_value is not None
+                if comparable and gpu_value is not None and cpu_value is not None
                 else None
             )
             row[f"{statistic}_time_reduction_percent"] = (
                 100.0 * (cpu_value - gpu_value) / cpu_value
-                if gpu_value is not None and cpu_value
+                if comparable and gpu_value is not None and cpu_value
                 else None
             )
         timers.append(row)
-    return {"gpu": gpu, "cpu": cpu, "timer_comparison": timers}
+    return {
+        "gpu": gpu,
+        "cpu": cpu,
+        "profiling_compatibility": {
+            "gpu_schema": gpu["profiling_schema"],
+            "cpu_schema": cpu["profiling_schema"],
+            "common_phase_comparison_enabled": matching_ca_v2,
+            "gpu_phase_coverage": profile_phase_coverage(gpu),
+            "cpu_phase_coverage": profile_phase_coverage(cpu),
+        },
+        "timer_comparison": timers,
+    }
 
 
 def metric_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -950,6 +1061,9 @@ def build_markdown(report: dict[str, Any]) -> str:
     flat = report["flat"]
     convergence = report["convergence"]
     performance = report["performance"]
+    compatibility = performance["profiling_compatibility"]
+    gpu_phase_coverage = compatibility["gpu_phase_coverage"]
+    cpu_phase_coverage = compatibility["cpu_phase_coverage"]
     total_timer = next(
         (
             row
@@ -1097,6 +1211,22 @@ def build_markdown(report: dict[str, Any]) -> str:
                 f"| Task-count coefficient of variation | "
                 f"{display_number(performance['gpu']['tasks'].get('coefficient_of_variation_percent'))}% | "
                 f"{display_number(performance['cpu']['tasks'].get('coefficient_of_variation_percent'))}% | — |"
+            ),
+            "",
+            (
+                "Common phase comparisons: "
+                + (
+                    "enabled (`ca-v2` is present in both logs)."
+                    if compatibility["common_phase_comparison_enabled"]
+                    else "disabled (both logs must declare `ca-v2`)."
+                )
+            ),
+            (
+                "Six-phase average-time coverage: "
+                f"GPU {display_number(gpu_phase_coverage['accounted_percent'])}%; "
+                f"CPU {display_number(cpu_phase_coverage['accounted_percent'])}%. "
+                "Small residuals can be caused by the timer's four-decimal output "
+                "rounding."
             ),
             "",
             "See `comparison_report.json`, `numerical_differences.csv`, and "

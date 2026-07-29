@@ -76,6 +76,67 @@ stream without a dedicated GPU-owner rank.
 `screen=true` enables the linear-time bridge pre-pass that identifies
 disconnecting single-line outages without a topology traversal per case.
 
+### Performance profiling
+
+Successful runs print `[profiling] schema=ca-v2` followed by the existing
+GridPACK timer categories and six common, non-overlapping CA phases:
+
+| Category | Inclusive scope |
+|---|---|
+| `CA: Configuration` | Input XML, runtime options, backend selection |
+| `CA: Model and Output Setup` | Network read/initialize and output metadata |
+| `CA: Base Case` | Base solve and base-result capture |
+| `CA: Contingency Setup` | N-1 construction, task/statistics setup, GPU options |
+| `CA: Contingency Processing` | Task dispatch, all CPU/GPU solves, case output |
+| `CA: Result Finalization` | Flat-file close/drain, sidecars, convergence, statistics |
+
+These phase boundaries are the same for CPU-only, optimized CPU, and opt-in
+GPU execution. Together they account for the timed portion of
+`CADriver::execute`; use the `Maximum time` values only for phase-level
+critical-path analysis, because maxima may come from different MPI ranks and
+must not be summed. `Total Application` remains the backwards-compatible
+cross-version wall-time comparison.
+
+The narrower `CA:` rows explain work inside those phases:
+
+| Detail category | Scope |
+|---|---|
+| `CA: Task Dispatch` | Waiting for and claiming distributed work |
+| `CA: Case Setup` | Applying a contingency and checking islands/slack transfer |
+| `CA: Exact Per-Case Solve` | Full CPU/PETSc solve for ordinary and fallback cases |
+| `CA: Case Evaluation and Output` | Limits, result capture, formatting calls, and statistics |
+| `CA: Case Restore` | Undoing contingency, controller, and slack state |
+| `CA: Flat Result Formatting` | Constructing flat CSV rows |
+| `CA: Flat Output Submit` | Direct write, memory append, or async-writer enqueue |
+| `CA: Flat Output Finalize` | Writer drain/close, MPI-IO, concatenation, and bus sidecar |
+| `CA: Convergence Output` | Gathering, sorting, and writing convergence rows |
+
+Detail categories are nested beneath the six phases and sometimes beneath one
+another, so they must not be added to the phase totals.
+
+The older `Powerflow:*`, `Vector Map:*`, and `Contingency:*` categories remain
+unchanged so existing log consumers continue to work. They are implementation
+diagnostics, not cross-path phases: in particular, `Contingency: Write Results`
+measures the legacy SerialIO string helper and does not include the direct
+`csv_flat` formatter or shared-file append.
+
+`CA GPU:*` categories break down the GPU implementation beneath
+`CA: Contingency Processing`. They have no stock-CPU equivalent and should not
+be interpreted as CPU/GPU speedup rows. They cover invariant construction,
+wave preparation and eligibility screening, the complete batched Newton solve,
+controller checks, result overlay, and restoration. Within batched Newton,
+separate rows cover solver/symbolic setup, host matrix/residual work, and
+numeric factorization/triangular solves.
+
+`CA GPU: Batch Newton` is the authoritative wall-time scope for the complete
+batched solve. cuDSS
+factorization and solve launches are asynchronous; their required blocking
+device-to-host result copy keeps the aggregate
+`CA GPU: Numeric Factorization and Triangular Solve` time representative, but
+an individual launch's work can be charged at the following synchronization
+point. The detail row is therefore a bottleneck guide, not a standalone GPU
+kernel benchmark.
+
 For `csv_flat`, `sharedFlatFile=true` (the default) lets ranks append complete
 case blocks to one file while computation continues. `bufferFlatOutput=true`
 instead buffers rank output and performs disjoint MPI-IO writes at the end; it

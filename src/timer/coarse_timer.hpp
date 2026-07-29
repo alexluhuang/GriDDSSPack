@@ -101,6 +101,39 @@ private:
   bool                p_profile;
 };
 
+/**
+ * Balance a timer category across normal returns and exceptions.
+ */
+class ScopedTimer {
+public:
+  ScopedTimer(CoarseTimer *timer, int category)
+    : p_timer(timer), p_category(category), p_active(timer != NULL)
+  {
+    if (p_active) p_timer->start(p_category);
+  }
+
+  ~ScopedTimer()
+  {
+    stop();
+  }
+
+  void stop()
+  {
+    if (p_active) {
+      p_timer->stop(p_category);
+      p_active = false;
+    }
+  }
+
+private:
+  ScopedTimer(const ScopedTimer&);
+  ScopedTimer& operator=(const ScopedTimer&);
+
+  CoarseTimer *p_timer;
+  int p_category;
+  bool p_active;
+};
+
 
 }    // utility
 }    // gridpack

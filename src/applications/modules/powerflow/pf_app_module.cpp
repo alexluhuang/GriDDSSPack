@@ -982,8 +982,6 @@ bool gridpack::powerflow::PFAppModule::nl_solve()
     helper.update(*helper.X);
   } catch (const Exception& e) {
     std::cerr << e.what() << std::endl;
-    timer->stop(t_lsolv);
-    timer->stop(t_total);
     ret = false;
   }
 
@@ -1193,7 +1191,6 @@ void gridpack::powerflow::PFAppModule::writeBus(const char *signal)
   timer->start(t_total);
   int t_write = timer->createCategory("Powerflow: Write Results");
   timer->start(t_write);
-  timer->start(t_total);
   p_busIO->write(signal);
   timer->stop(t_write);
   timer->stop(t_total);
@@ -1223,7 +1220,6 @@ void gridpack::powerflow::PFAppModule::writeBranch(const char *signal)
   timer->start(t_total);
   int t_write = timer->createCategory("Powerflow: Write Results");
   timer->start(t_write);
-  timer->start(t_total);
   p_branchIO->write(signal);
   timer->stop(t_write);
   timer->stop(t_total);

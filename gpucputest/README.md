@@ -12,6 +12,15 @@ GridPACK CPU result set. It reports:
   differences, and status transitions;
 - application and phase timing speedups plus MPI task-load balance.
 
+`timing_comparison.csv` marks each row as comparable or diagnostic. Whole-run
+`Total Application` is comparable with stock logs. The six `CA:` common phases
+are compared only when both logs declare the `ca-v2` profiling schema. Legacy
+and `CA GPU:` detail rows retain their raw durations but do not receive a
+speedup, preventing unlike timer scopes from being reported as acceleration.
+The JSON report also sums the six average phase times and reports their coverage
+of average `Total Application`; this exposes a missing phase while allowing for
+the timer's four-decimal log rounding.
+
 The 8–9 GB flat CSVs are never merged as one in-memory table. dask-cuDF streams
 each CSV into event-bucketed Parquet partitions, and cuDF compares one bounded
 event bucket at a time on the GPU.

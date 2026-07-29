@@ -43,6 +43,7 @@
 #include <string>
 #include <vector>
 #include "gridpack/utilities/exception.hpp"
+#include "gridpack/timer/coarse_timer.hpp"
 
 #ifdef GRIDPACK_WITH_CUDSS
 #include "gridpack/math/cudss/cudss_batched_solver.hpp"
@@ -217,10 +218,21 @@ public:
     p_status.assign(W, BatchCaseStatus());
     if (W <= 0) return p_status;
 
+    gridpack::utility::CoarseTimer *timer =
+      gridpack::utility::CoarseTimer::instance();
+    const int t_solver_setup = timer->createCategory(
+        "CA GPU: Solver Setup and Symbolic Analysis");
+    const int t_host_work = timer->createCategory(
+        "CA GPU: Host Assembly and Update");
+    const int t_linear = timer->createCategory(
+        "CA GPU: Numeric Factorization and Triangular Solve");
+
     // One symbolic analysis for the shared base pattern, reused by every case.
+    gridpack::utility::ScopedTimer solverSetupTimer(timer, t_solver_setup);
     gridpack::math::CuDSSBatchedSolver solver(n, nnz, p_asm.rowptr(),
                                               p_asm.colind(), 1);
     solver.analyze();
+    solverSetupTimer.stop();
 
     std::vector<double> vals(nnz);
     std::vector<double> rhs(n, 0.0);
@@ -250,50 +262,80 @@ public:
         int adaptiveRefactors = 0;
         int solvesSinceFactor = 0;
         bool previousStepRefactoredForPoorProgress = false;
-        double m = p_asm.assembleLive(k, &vals[0], &rhs[0]);   // J + RHS, branch out
+        double m = 0.0;
+        {
+          gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+          m = p_asm.assembleLive(k, &vals[0], &rhs[0]);
+        }
         if (m <= p_tol) {
           conv = true;
-        } else if (solver.factorizeValues(&vals[0])) {         // factor this case ONCE
-          const double poorProgressThreshold =
-            std::max(0.5, 1.0 - 0.5 * p_damping);
-          for (it = 1; it < p_chordCap; ++it) {
-            const double previousMismatch = m;
-            if (!solver.solveReuse(&rhs[0], &sol[0])) break;    // reuse factor -> fallback
-            m = p_asm.updateLiveRhs(k, &sol[0], &rhs[0]);       // chord step, RHS only
-            if (m <= p_tol) { conv = true; ++it; break; }
-            if (!std::isfinite(m) || previousMismatch <= 0.0) break;
+        } else {
+          bool factored = false;
+          {
+            gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
+            factored = solver.factorizeValues(&vals[0]);
+          }
+          if (factored) {
+            const double poorProgressThreshold =
+              std::max(0.5, 1.0 - 0.5 * p_damping);
+            for (it = 1; it < p_chordCap; ++it) {
+              const double previousMismatch = m;
+              bool solved = false;
+              {
+                gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
+                solved = solver.solveReuse(&rhs[0], &sol[0]);
+              }
+              if (!solved) break;
+              {
+                gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+                m = p_asm.updateLiveRhs(k, &sol[0], &rhs[0]);
+              }
+              if (m <= p_tol) { conv = true; ++it; break; }
+              if (!std::isfinite(m) || previousMismatch <= 0.0) break;
 
-            ++solvesSinceFactor;
-            const double ratio = m / previousMismatch;
-            const bool poorProgress = ratio >= poorProgressThreshold;
-            const bool scheduledRefresh =
-              p_refactorEvery > 1 && solvesSinceFactor >= p_refactorEvery;
+              ++solvesSinceFactor;
+              const double ratio = m / previousMismatch;
+              const bool poorProgress = ratio >= poorProgressThreshold;
+              const bool scheduledRefresh =
+                p_refactorEvery > 1 && solvesSinceFactor >= p_refactorEvery;
 
-            // A poor step immediately after an adaptive refresh says the current
-            // case is a bad fit for modified Newton.  Fall back to the exact CPU
-            // path instead of degenerating into repeated expensive GPU factors.
-            if (poorProgress && previousStepRefactoredForPoorProgress) break;
-            if (poorProgress &&
-                adaptiveRefactors >= p_maxAdaptiveRefactors) break;
+              // A poor step immediately after an adaptive refresh says the current
+              // case is a bad fit for modified Newton.  Fall back to the exact CPU
+              // path instead of degenerating into repeated expensive GPU factors.
+              if (poorProgress && previousStepRefactoredForPoorProgress) break;
+              if (poorProgress &&
+                  adaptiveRefactors >= p_maxAdaptiveRefactors) break;
 
-            if (poorProgress || scheduledRefresh) {
-              p_asm.assembleLiveJac(k, &vals[0]);
-              if (!solver.factorizeValues(&vals[0])) break;
-              ++refactorizations;
-              solvesSinceFactor = 0;
-              if (poorProgress) {
-                ++adaptiveRefactors;
-                previousStepRefactoredForPoorProgress = true;
+              if (poorProgress || scheduledRefresh) {
+                {
+                  gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+                  p_asm.assembleLiveJac(k, &vals[0]);
+                }
+                {
+                  gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
+                  factored = solver.factorizeValues(&vals[0]);
+                }
+                if (!factored) break;
+                ++refactorizations;
+                solvesSinceFactor = 0;
+                if (poorProgress) {
+                  ++adaptiveRefactors;
+                  previousStepRefactoredForPoorProgress = true;
+                } else {
+                  previousStepRefactoredForPoorProgress = false;
+                }
               } else {
                 previousStepRefactoredForPoorProgress = false;
               }
-            } else {
-              previousStepRefactoredForPoorProgress = false;
             }
           }
         }
-        const BatchMismatchInfo minfo = p_asm.lastMismatch();
-        p_asm.finishLive(k);
+        BatchMismatchInfo minfo;
+        {
+          gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+          minfo = p_asm.lastMismatch();
+          p_asm.finishLive(k);
+        }
         p_status[k].converged = conv;
         p_status[k].iterations = it;
         p_status[k].mismatch = m;
@@ -309,18 +351,34 @@ public:
     for (int k = 0; k < W; ++k) {
       bool conv = false;
       int it = 1;
-      double m = p_asm.assembleLive(k, &vals[0], &rhs[0]);   // warm start, iter 1
+      double m = 0.0;
+      {
+        gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+        m = p_asm.assembleLive(k, &vals[0], &rhs[0]);
+      }
       if (m <= p_tol) {
         conv = true;
       } else {
         for (it = 1; it < p_maxIter; ++it) {
-          if (!solver.solveOne(&vals[0], &rhs[0], &sol[0])) break;   // -> fallback
-          m = p_asm.updateLive(k, &sol[0], &vals[0], &rhs[0]);       // apply + reassemble
+          bool solved = false;
+          {
+            gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
+            solved = solver.solveOne(&vals[0], &rhs[0], &sol[0]);
+          }
+          if (!solved) break;
+          {
+            gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+            m = p_asm.updateLive(k, &sol[0], &vals[0], &rhs[0]);
+          }
           if (m <= p_tol) { conv = true; ++it; break; }
         }
       }
-      const BatchMismatchInfo minfo = p_asm.lastMismatch();
-      p_asm.finishLive(k);
+      BatchMismatchInfo minfo;
+      {
+        gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
+        minfo = p_asm.lastMismatch();
+        p_asm.finishLive(k);
+      }
       p_status[k].converged = conv;
       p_status[k].iterations = it;
       p_status[k].mismatch = m;
