@@ -7,6 +7,7 @@
 // -------------------------------------------------------------
 
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 #include "gridpack/applications/modules/powerflow/pf_screen.hpp"
@@ -25,6 +26,21 @@ bool expect(const std::vector<int>& actual, const std::vector<int>& expected,
   return false;
 }
 
+template <class Exception, class Function>
+bool expectThrows(Function function, const char* name)
+{
+  try {
+    function();
+  } catch (const Exception&) {
+    return true;
+  } catch (...) {
+    std::fprintf(stderr, "%s threw the wrong exception type\n", name);
+    return false;
+  }
+  std::fprintf(stderr, "%s did not throw\n", name);
+  return false;
+}
+
 } // namespace
 
 int main()
@@ -37,8 +53,19 @@ int main()
     gridpack::powerflow::N1ConnectivityScreen screen(
         4, std::vector<int>(from, from + 4), std::vector<int>(to, to + 4));
     const int expected[] = {1, 1, 1, 2};
-    ok &= expect(screen.screenAllBranchOutages(),
-                 std::vector<int>(expected, expected + 4), "cycle-with-tail");
+    const std::vector<int> expectedVector(expected, expected + 4);
+    ok &= expect(screen.screenAllBranchOutages(), expectedVector,
+                 "cycle-with-tail");
+    ok &= screen.componentsWithout(-1) == 1;
+    for (int e = 0; e < 4; ++e) {
+      ok &= screen.componentsWithout(e) == expected[e];
+    }
+    ok &= expectThrows<std::out_of_range>(
+        [&screen]() { screen.componentsWithout(-2); },
+        "negative-outage-index");
+    ok &= expectThrows<std::out_of_range>(
+        [&screen]() { screen.componentsWithout(4); },
+        "large-outage-index");
   }
 
   {
@@ -63,6 +90,34 @@ int main()
     ok &= result.size() == from.size() && result.front() == 2 &&
           result.back() == 2;
   }
+
+  ok &= expectThrows<std::invalid_argument>(
+      []() {
+        gridpack::powerflow::N1ConnectivityScreen(
+            -1, std::vector<int>(), std::vector<int>());
+      },
+      "negative-bus-count");
+
+  ok &= expectThrows<std::invalid_argument>(
+      []() {
+        gridpack::powerflow::N1ConnectivityScreen(
+            2, std::vector<int>(1, 0), std::vector<int>());
+      },
+      "endpoint-size-mismatch");
+
+  ok &= expectThrows<std::out_of_range>(
+      []() {
+        gridpack::powerflow::N1ConnectivityScreen(
+            2, std::vector<int>(1, -1), std::vector<int>(1, 1));
+      },
+      "negative-from-endpoint");
+
+  ok &= expectThrows<std::out_of_range>(
+      []() {
+        gridpack::powerflow::N1ConnectivityScreen(
+            2, std::vector<int>(1, 0), std::vector<int>(1, 2));
+      },
+      "large-to-endpoint");
 
   std::printf("pf_screen_test: %s\n", ok ? "PASSED" : "FAILED");
   return ok ? 0 : 1;

@@ -77,22 +77,21 @@ public:
       p_d_values(NULL), p_d_rhs(NULL), p_d_sol(NULL),
       p_valsAll(NULL), p_analyzed(false)
   {
-    GP_CUDSS_CHECK(cudssCreate(&p_handle));
-    GP_CUDSS_CHECK(cudssConfigCreate(&p_config));
-    GP_CUDSS_CHECK(cudssDataCreate(p_handle, &p_data));
-    p_alloc(rowptr, colind);
+    p_validateInputs(rowptr, colind);
+    try {
+      GP_CUDSS_CHECK(cudssCreate(&p_handle));
+      GP_CUDSS_CHECK(cudssConfigCreate(&p_config));
+      GP_CUDSS_CHECK(cudssDataCreate(p_handle, &p_data));
+      p_alloc(rowptr, colind);
+    } catch (...) {
+      p_freeResources();
+      throw;
+    }
   }
 
   ~CuDSSBatchedSolver(void)
   {
-    if (p_A) cudssMatrixDestroy(p_A);
-    if (p_b) cudssMatrixDestroy(p_b);
-    if (p_x) cudssMatrixDestroy(p_x);
-    cudaFree(p_d_rowptr); cudaFree(p_d_colind);
-    cudaFree(p_d_values); cudaFree(p_d_rhs); cudaFree(p_d_sol);
-    if (p_data)   cudssDataDestroy(p_handle, p_data);
-    if (p_config) cudssConfigDestroy(p_config);
-    if (p_handle) cudssDestroy(p_handle);
+    p_freeResources();
   }
 
   int rows(void) const       { return p_n; }
@@ -282,6 +281,58 @@ private:
   const double *p_valsAll;   // wave value buffer [W*nnz] (not owned)
   bool p_analyzed;
   std::vector<int> p_h_rowptr, p_h_colind;   // host pattern (for residual check)
+
+  void p_validateInputs(const int *rowptr, const int *colind) const
+  {
+    if (p_n <= 0) {
+      throw gridpack::Exception("cuDSS batched solver: matrix size must be positive");
+    }
+    if (p_nnz < 0) {
+      throw gridpack::Exception("cuDSS batched solver: nnz must be nonnegative");
+    }
+    if (p_W <= 0) {
+      throw gridpack::Exception("cuDSS batched solver: batch count must be positive");
+    }
+    if (!rowptr) {
+      throw gridpack::Exception("cuDSS batched solver: CSR row offsets are null");
+    }
+    if (p_nnz > 0 && !colind) {
+      throw gridpack::Exception("cuDSS batched solver: CSR column indices are null");
+    }
+    if (rowptr[0] != 0 || rowptr[p_n] != p_nnz) {
+      throw gridpack::Exception(
+          "cuDSS batched solver: CSR row offsets have invalid endpoints");
+    }
+    for (int i = 0; i < p_n; ++i) {
+      if (rowptr[i] < 0 || rowptr[i] > rowptr[i + 1] ||
+          rowptr[i + 1] > p_nnz) {
+        throw gridpack::Exception(
+            "cuDSS batched solver: CSR row offsets are not monotone");
+      }
+    }
+    for (int j = 0; j < p_nnz; ++j) {
+      if (colind[j] < 0 || colind[j] >= p_n) {
+        throw gridpack::Exception(
+            "cuDSS batched solver: CSR column index is out of range");
+      }
+    }
+  }
+
+  void p_freeResources(void)
+  {
+    if (p_A) { cudssMatrixDestroy(p_A); p_A = NULL; }
+    if (p_b) { cudssMatrixDestroy(p_b); p_b = NULL; }
+    if (p_x) { cudssMatrixDestroy(p_x); p_x = NULL; }
+    if (p_d_rowptr) { cudaFree(p_d_rowptr); p_d_rowptr = NULL; }
+    if (p_d_colind) { cudaFree(p_d_colind); p_d_colind = NULL; }
+    if (p_d_values) { cudaFree(p_d_values); p_d_values = NULL; }
+    if (p_d_rhs) { cudaFree(p_d_rhs); p_d_rhs = NULL; }
+    if (p_d_sol) { cudaFree(p_d_sol); p_d_sol = NULL; }
+    if (p_data) { cudssDataDestroy(p_handle, p_data); p_data = NULL; }
+    if (p_config) { cudssConfigDestroy(p_config); p_config = NULL; }
+    if (p_handle) { cudssDestroy(p_handle); p_handle = NULL; }
+    p_analyzed = false;
+  }
 
   void p_alloc(const int *rowptr, const int *colind)
   {

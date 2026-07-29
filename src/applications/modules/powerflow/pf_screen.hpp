@@ -31,7 +31,9 @@
 
 #include <vector>
 #include <algorithm>
+#include <limits>
 #include <numeric>
+#include <stdexcept>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -57,7 +59,28 @@ public:
                        const std::vector<int>& from,
                        const std::vector<int>& to)
     : p_nbus(nbus), p_from(from), p_to(to)
-  {}
+  {
+    if (p_nbus < 0) {
+      throw std::invalid_argument(
+          "N1ConnectivityScreen: bus count must be nonnegative");
+    }
+    if (p_from.size() != p_to.size()) {
+      throw std::invalid_argument(
+          "N1ConnectivityScreen: branch endpoint arrays have different sizes");
+    }
+    if (p_from.size() >
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+      throw std::invalid_argument(
+          "N1ConnectivityScreen: branch count exceeds supported index range");
+    }
+    for (size_t e = 0; e < p_from.size(); ++e) {
+      if (p_from[e] < 0 || p_from[e] >= p_nbus ||
+          p_to[e] < 0 || p_to[e] >= p_nbus) {
+        throw std::out_of_range(
+            "N1ConnectivityScreen: branch endpoint is outside the bus range");
+      }
+    }
+  }
 
   /// Number of connected components with branch @c outage removed.
   /**
@@ -69,9 +92,13 @@ public:
    */
   int componentsWithout(int outage) const
   {
+    const int K = static_cast<int>(p_from.size());
+    if (outage < -1 || outage >= K) {
+      throw std::out_of_range(
+          "N1ConnectivityScreen: outage index is outside the branch range");
+    }
     std::vector<int> root(p_nbus);
     std::iota(root.begin(), root.end(), 0);
-    const int K = static_cast<int>(p_from.size());
     for (int e = 0; e < K; ++e) {
       if (e == outage) continue;
       p_merge(root, p_from[e], p_to[e]);
@@ -102,7 +129,7 @@ public:
     std::vector<std::vector<Edge> > graph(p_nbus);
     for (int e = 0; e < K; ++e) {
       const int u = p_from[e], v = p_to[e];
-      if (u < 0 || u >= p_nbus || v < 0 || v >= p_nbus || u == v) continue;
+      if (u == v) continue;
       graph[u].push_back(Edge(v, e));
       graph[v].push_back(Edge(u, e));
     }

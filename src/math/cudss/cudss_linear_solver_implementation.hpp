@@ -50,6 +50,8 @@
 #ifdef GRIDPACK_WITH_CUDSS
 
 #include <cstddef>
+#include <cstring>
+#include <vector>
 #include <cuda_runtime.h>
 #include <cudss.h>
 
@@ -149,6 +151,8 @@ protected:
   mutable bool     p_matricesCreated;  ///< have the cudssMatrix wrappers been created
   mutable PetscInt p_nCached;          ///< rows the buffers/analysis were sized for
   mutable PetscInt p_nnzCached;        ///< nnz the buffers/analysis were sized for
+  mutable std::vector<PetscInt> p_rowptrCached; ///< exact analyzed CSR row offsets
+  mutable std::vector<PetscInt> p_colindCached; ///< exact analyzed CSR columns
 
   // ---- configuration ----------------------------------------------------
   int  p_irSteps;        ///< iterative-refinement steps (0 = off)
@@ -188,6 +192,8 @@ protected:
     if (p_d_sol)    { cudaFree(p_d_sol);    p_d_sol = NULL; }
     p_analyzed = false;
     p_factored = false;   // factors are invalid once the pattern is rebuilt
+    p_rowptrCached.clear();
+    p_colindCached.clear();
   }
 
   // ---------------------------------------------------------------------
@@ -199,7 +205,17 @@ protected:
     const PetscInt n   = csr.rows();
     const PetscInt nnz = csr.nnz();
 
-    if (p_analyzed && n == p_nCached && nnz == p_nnzCached) {
+    const bool sameRowptr =
+        p_rowptrCached.size() == static_cast<std::size_t>(n + 1) &&
+        std::memcmp(&p_rowptrCached[0], csr.rowptr(),
+                    static_cast<std::size_t>(n + 1) * sizeof(PetscInt)) == 0;
+    const bool sameColind =
+        p_colindCached.size() == static_cast<std::size_t>(nnz) &&
+        (nnz == 0 ||
+         std::memcmp(&p_colindCached[0], csr.colind(),
+                     static_cast<std::size_t>(nnz) * sizeof(PetscInt)) == 0);
+    if (p_analyzed && n == p_nCached && nnz == p_nnzCached &&
+        sameRowptr && sameColind) {
       return;  // pattern unchanged -- reuse existing analysis
     }
 
@@ -245,6 +261,12 @@ protected:
     p_analyzed  = true;
     p_nCached   = n;
     p_nnzCached = nnz;
+    p_rowptrCached.assign(csr.rowptr(), csr.rowptr() + n + 1);
+    if (nnz > 0) {
+      p_colindCached.assign(csr.colind(), csr.colind() + nnz);
+    } else {
+      p_colindCached.clear();
+    }
   }
 
   // ---------------------------------------------------------------------

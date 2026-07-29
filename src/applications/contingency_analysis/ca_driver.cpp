@@ -50,6 +50,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <cctype>
 #include <climits>
 #include <set>
 
@@ -462,8 +464,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       if (!tok[i].empty()) monitorAreas.insert(atoi(tok[i].c_str()));
     }
   }
-  // Which rating column csv_flat/csv_delta emit. A|B|C, default C.
-  // Falls back A->B->C order if requested rating is zero/missing.
+  // Which rating column csv_flat/csv_delta emit.  In csv_flat, rate_mva,
+  // loading_percent, and viol all use this same selected limit. A|B|C,
+  // default C.
+  // Missing B falls back to A; missing C falls back to B and then A.
   std::string contingencyRating = "C";
   cursor->get("contingencyRating", &contingencyRating);
   util.toUpper(contingencyRating);
@@ -763,7 +767,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     }
   }
   // Base case always uses rate-A (PSS/E "normal" rating). Contingency rows
-  // use whichever the user picked, with A->B->C fallback if zero/missing.
+  // use whichever the user picked, with B->A or C->B->A fallback.
   auto pickContRate = [&](const BranchRates &r) -> double {
     if (contingencyRating == "A") {
       return r.rate_a;
@@ -911,6 +915,48 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // _convergence.csv: written for every outputFormat.
   bool emitConv = true;
 
+  // Quote a string only when CSV requires it.  Contingency names are supplied
+  // by the input deck and are not restricted to identifier characters.
+  auto csvField = [](const std::string &value) -> std::string {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) return value;
+    std::string quoted;
+    quoted.reserve(value.size() + 2);
+    quoted.push_back('"');
+    for (size_t i = 0; i < value.size(); ++i) {
+      if (value[i] == '"') quoted.push_back('"');
+      quoted.push_back(value[i]);
+    }
+    quoted.push_back('"');
+    return quoted;
+  };
+
+  // The event prefix is prepared once per case and retained at the beginning
+  // of rowScratch.  Only the fixed-format branch suffix is regenerated for
+  // each row.  In the uncommon event that the suffix exceeds its initial
+  // capacity, resize and retry instead of emitting a truncated CSV row.
+  auto appendFlatRow = [](std::string &block, std::vector<char> &rowScratch,
+                          size_t prefixLen, int from, int to,
+                          const char *ckt, double p, double q,
+                          double flowMva, double rateSelected,
+                          double loading, int viol, double vFrom,
+                          double vTo, double aFrom, double aTo) {
+    int suffixLen = -1;
+    for (;;) {
+      const size_t suffixCapacity = rowScratch.size() - prefixLen;
+      suffixLen = std::snprintf(&rowScratch[prefixLen], suffixCapacity,
+          "%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.2f,%d,"
+          "%.6f,%.6f,%.4f,%.4f\n",
+          from, to, ckt, p, q, flowMva, rateSelected, loading,
+          viol, vFrom, vTo, aFrom, aTo);
+      if (suffixLen < 0) {
+        throw gridpack::Exception("Unable to format csv_flat row");
+      }
+      if (static_cast<size_t>(suffixLen) < suffixCapacity) break;
+      rowScratch.resize(prefixLen + static_cast<size_t>(suffixLen) + 1);
+    }
+    block.append(&rowScratch[0], prefixLen + static_cast<size_t>(suffixLen));
+  };
+
   // Lambda: parse current solved flow_str/vr_str and stream one CSV row
   // per branch into the rank's .part file. Called once per converged case
   // (base + each contingency) on every task communicator; non-rank-0
@@ -921,10 +967,12 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       if (!emit) return;
       std::string frow;
       frow.reserve(static_cast<size_t>(pf_network->numBranches()) * 160);
-      char lbuf[256];
-      char ct_name[24];
-      std::strncpy(ct_name, name.c_str(), sizeof(ct_name) - 1);
-      ct_name[sizeof(ct_name) - 1] = '\0';
+      std::ostringstream prefixStream;
+      prefixStream << event_idx << "," << csvField(name) << ",";
+      const std::string rowPrefix = prefixStream.str();
+      const size_t prefixLen = rowPrefix.size();
+      std::vector<char> rowScratch(rowPrefix.begin(), rowPrefix.end());
+      rowScratch.resize(prefixLen + 256);
       const double radiansToDegrees = 180.0 / (4.0 * std::atan(1.0));
       const int nbranch = pf_network->numBranches();
       for (int bi = 0; bi < nbranch; ++bi) {
@@ -991,17 +1039,11 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
           const double flowMva = std::sqrt(p * p + q * q);
           const double loading = rateSelected > 0.0 ?
             100.0 * flowMva / rateSelected : 0.0;
-          const int viol = rateA > 0.0 && flowMva / rateA > 1.0 ? 1 : 0;
-          const int ln = std::snprintf(lbuf, sizeof(lbuf),
-              "%d,%s,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.2f,%d,"
-              "%.6f,%.6f,%.4f,%.4f\n",
-              event_idx, ct_name, from, to, ckt.c_str(), p, q, flowMva,
-              rateSelected, loading, viol, vFrom, vTo, aFrom, aTo);
-          if (ln > 0) {
-            frow.append(lbuf, static_cast<size_t>(
-                ln < static_cast<int>(sizeof(lbuf)) ?
-                ln : static_cast<int>(sizeof(lbuf)) - 1));
-          }
+          const int viol =
+            rateSelected > 0.0 && flowMva > rateSelected ? 1 : 0;
+          appendFlatRow(frow, rowScratch, prefixLen, from, to, ckt.c_str(),
+                        p, q, flowMva, rateSelected, loading, viol, vFrom,
+                        vTo, aFrom, aTo);
           ++flatRowCount;
         }
       }
@@ -1018,7 +1060,12 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     // (the 24k-bus training network writes ~6M rows / >800 MB).
     std::string frow;
     frow.reserve(b_strs.size() * 100 + 64);
-    char lbuf[256];
+    std::ostringstream prefixStream;
+    prefixStream << event_idx << "," << csvField(name) << ",";
+    const std::string rowPrefix = prefixStream.str();
+    const size_t prefixLen = rowPrefix.size();
+    std::vector<char> rowScratch(rowPrefix.begin(), rowPrefix.end());
+    rowScratch.resize(prefixLen + 256);
     std::map<int, std::pair<double,double> > vbymag_ang;
     for (size_t vi = 0; vi < v_strs.size(); vi++) {
       int    bus_id = 0, use_vmag = 0, changed = 0;
@@ -1028,17 +1075,15 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         vbymag_ang[bus_id] = std::make_pair(vmag, angle);
       }
     }
-    char ct_name[24];
-    std::strncpy(ct_name, name.c_str(), sizeof(ct_name) - 1);
-    ct_name[sizeof(ct_name) - 1] = '\0';
     for (size_t bi = 0; bi < b_strs.size(); bi++) {
       char ckt_buf[16] = {0};
-      int viol = 0;
+      int rateAViol = 0;
       double p = 0.0, q = 0.0, perf = 0.0, ratea = 0.0;
       int from = 0, to = 0;
       if (sscanf(b_strs[bi].c_str(),
                  "%d %d %15s %lf %lf %lf %lf %d",
-                 &from, &to, ckt_buf, &p, &q, &perf, &ratea, &viol) != 8) {
+                 &from, &to, ckt_buf, &p, &q, &perf, &ratea,
+                 &rateAViol) != 8) {
         continue;
       }
       char ckt[4];
@@ -1072,11 +1117,11 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       double ang_from_deg = (vf != vbymag_ang.end()) ? vf->second.second : 0.0;
       double v_to         = (vt != vbymag_ang.end()) ? vt->second.first  : 0.0;
       double ang_to_deg   = (vt != vbymag_ang.end()) ? vt->second.second : 0.0;
-      int ln = snprintf(lbuf, sizeof(lbuf),
-          "%d,%s,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.2f,%d,%.6f,%.6f,%.4f,%.4f\n",
-          event_idx, ct_name, from, to, ckt, p, q, flow_mva, rate_sel,
-          loading_pct, viol, v_from, v_to, ang_from_deg, ang_to_deg);
-      if (ln > 0) frow.append(lbuf, static_cast<size_t>(ln < (int)sizeof(lbuf) ? ln : (int)sizeof(lbuf) - 1));
+      const int viol =
+        rate_sel > 0.0 && flow_mva > rate_sel ? 1 : 0;
+      appendFlatRow(frow, rowScratch, prefixLen, from, to, ckt, p, q,
+                    flow_mva, rate_sel, loading_pct, viol, v_from, v_to,
+                    ang_from_deg, ang_to_deg);
       flatRowCount++;
     }
     writeFlatBlock(frow);
@@ -1647,11 +1692,12 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   std::map<int, gridpack::utility::ConvergenceSummary> batchConvByTask;
 #ifdef GRIDPACK_WITH_CUDSS
   boost::scoped_ptr<gridpack::powerflow::GridpackBatchAssembler> batchAsm;
+  bool batchRankHealthy = true;
 #endif
   bool gpu_batched = false;
   bool batchWarmStart = true;
   bool batchConnectivityScreen = true;
-  int batchWaveSize = 0;
+  int batchWaveSize = 8;
   {
     std::string t;
     gridpack::utility::Configuration::CursorPtr gcur =
@@ -1667,11 +1713,28 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     t.clear();
     if (gcur && gcur->get("waveSize", &t)) {
       util.toLower(t);
-      if (t != "auto") batchWaveSize = std::max(0, std::atoi(t.c_str()));
+      if (t != "auto") {
+        errno = 0;
+        char *endptr = NULL;
+        const long parsed = std::strtol(t.c_str(), &endptr, 10);
+        while (endptr && *endptr &&
+               std::isspace(static_cast<unsigned char>(*endptr))) {
+          ++endptr;
+        }
+        if (errno == ERANGE || endptr == t.c_str() ||
+            (endptr && *endptr != '\0') || parsed <= 0 ||
+            parsed > static_cast<long>(INT_MAX)) {
+          throw gridpack::Exception(
+              std::string("Invalid GPU waveSize '") + t +
+              "': use 'auto' or a positive integer");
+        }
+        batchWaveSize = static_cast<int>(parsed);
+      }
     }
   }
   double batchTol = 1.0e-6;
   int batchMaxIter = 50;
+  int batchChordCap = 0;
   int batchRefactorEvery = 1;
   bool batchConstantFactor = false;
   double batchDamping = 1.0;
@@ -1697,6 +1760,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       config->getCursor("Configuration.Powerflow.LinearSolver");
     if (lcur) {
       lcur->get("refactorEvery", &batchRefactorEvery);
+      lcur->get("chordCap", &batchChordCap);
       std::string cf;
       if (lcur->get("constantFactor", &cf)) {
         util.toLower(cf);
@@ -1707,6 +1771,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       }
     }
   }
+  if (batchChordCap <= 0) batchChordCap = batchMaxIter;
   // The batched wave drives cuDSS DIRECTLY (CuDSSBatchedSolver), so it only needs
   // cuDSS to be built + a device present -- not the default backend to be cuDSS.
   // In fact for the batched path the default backend is deliberately left on CPU
@@ -1725,10 +1790,29 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   bool useBatched = gpuEnabled && gpu_batched && cudssActive &&
                     (grp_size == 1) &&
                     !pf_areaInterchange;
-  if (useBatched && batchWaveSize == 0) {
-    // Keep every rank's reservation small so all ranks return frequently to
-    // the shared dynamic task queue.
-    batchWaveSize = 8;
+  const bool batchOutputFullRefresh = pf_switchedShunt || pf_ltc;
+  if (useBatched) {
+    // The assembler keeps voltage magnitude and angle for every case in the
+    // rank-local wave: 2 * waveSize * nbus doubles.  Bound that storage to
+    // 256 MiB per rank and impose an absolute 256-case cap so a mistyped deck
+    // cannot create a multi-gigabyte allocation.
+    const unsigned long long stateBudget = 256ULL * 1024ULL * 1024ULL;
+    const unsigned long long buses =
+      static_cast<unsigned long long>(std::max(1, nbus));
+    const unsigned long long perCaseBytes =
+      2ULL * static_cast<unsigned long long>(sizeof(double)) * buses;
+    unsigned long long memoryCap = stateBudget / perCaseBytes;
+    if (memoryCap == 0) memoryCap = 1;
+    const int waveCap = static_cast<int>(
+        std::min<unsigned long long>(256ULL, memoryCap));
+    if (batchWaveSize > waveCap) {
+      if (world.rank() == 0) {
+        printf("NOTE: GPU waveSize=%d exceeds the per-rank limit for this "
+               "%d-bus case; capped at %d (256 MiB/256-case maximum).\n",
+               batchWaveSize, nbus, waveCap);
+      }
+      batchWaveSize = waveCap;
+    }
   }
   if (gpu_batched && world.rank() == 0) {
     if (!gpuEnabled)
@@ -1747,10 +1831,11 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     else
       printf("GPU batched contingency engine ENABLED on all %d rank(s), "
              "waveSize=%d "
-             "(tol=%.1e, maxIter=%d, solve=%s, warmStart=%s, damping=%.2f, "
+             "(tol=%.1e, maxIter=%d, chordCap=%d, solve=%s, warmStart=%s, "
+             "damping=%.2f, "
              "qlim=%s, shunt=%s, ltc=%s via post-wave fallback).\n",
              world.size(), batchWaveSize,
-             batchTol, batchMaxIter,
+             batchTol, batchMaxIter, batchChordCap,
              batchConstantFactor ? "constant-factor/chord" : "exact-Newton",
              batchWarmStart ? "true" : "false", batchDamping,
              check_Qlim ? "on" : "off", pf_switchedShunt ? "on" : "off",
@@ -1839,22 +1924,68 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     // Skip power flow if contingency setup failed (no valid slack) or islanding detected
     bool slackCapacityOk = true;  // Will be checked after solve
     bool solveOk = false;
+    bool usedBatchOverlay = false;
+    int batchOverlayIndex = -1;
 #ifdef GRIDPACK_WITH_CUDSS
     std::map<int,int>::iterator _bit = batchIndexByTask.find(task_id);
     if (_bit != batchIndexByTask.end()) {
-      // Pre-solved by the GPU batch: overlay its converged state (the branch is
-      // already out of service from setContingency above, restoreSlack matched)
-      // rather than re-solving, so the capture below sees the batched solution.
-      batchAsm->applyCaseForOutput(_bit->second);
-      solveOk = (batchConverged[_bit->second] != 0);
-      // solve() was skipped, so inject the batched convergence summary; without
-      // this, collectResults() (json/csv) would copy a stale p_convergence.
-      std::map<int, gridpack::utility::ConvergenceSummary>::iterator _ci =
-        batchConvByTask.find(task_id);
-      if (_ci != batchConvByTask.end()) pf_app.setConvergence(_ci->second);
-    } else
+      try {
+        // Pre-solved by the GPU batch: overlay its converged state (the branch
+        // is already out of service from setContingency above) rather than
+        // re-solving, so the capture below sees the batched solution.
+        batchOverlayIndex = _bit->second;
+        if (batchOverlayIndex < 0 ||
+            batchOverlayIndex >= static_cast<int>(batchConverged.size())) {
+          throw gridpack::Exception("Invalid batched output case index");
+        }
+        batchAsm->applyCaseForOutput(batchOverlayIndex,
+                                     batchOutputFullRefresh);
+        solveOk = (batchConverged[batchOverlayIndex] != 0);
+        usedBatchOverlay = true;
+        // solve() was skipped, so inject the batched convergence summary;
+        // otherwise collectResults() would copy a stale p_convergence.
+        std::map<int, gridpack::utility::ConvergenceSummary>::iterator _ci =
+          batchConvByTask.find(task_id);
+        if (_ci != batchConvByTask.end()) pf_app.setConvergence(_ci->second);
+      } catch (const std::exception& e) {
+        printf("p[%d] batched output overlay failed for task %d: %s; "
+               "using the exact CPU path\n", world.rank(), task_id, e.what());
+        batchRankHealthy = false;
+        batchIndexByTask.clear();
+        batchConvByTask.clear();
+        pf_app.unSetContingency(events[task_id]);
+        try {
+          batchAsm->restoreBaseState();
+        } catch (...) {
+          // The exact solve below rebuilds its network matrices.
+        }
+        pf_app.resetVoltages();
+        pf_network->updateBuses();
+        contingencyFound = pf_app.setContingency(events[task_id]);
+        islandCount = pf_app.getIslandCount();
+        hasLoneBus = pf_app.hasLoneBus();
+        islandDetected = (islandCount > 1);
+      } catch (...) {
+        printf("p[%d] batched output overlay failed for task %d; "
+               "using the exact CPU path\n", world.rank(), task_id);
+        batchRankHealthy = false;
+        batchIndexByTask.clear();
+        batchConvByTask.clear();
+        pf_app.unSetContingency(events[task_id]);
+        try {
+          batchAsm->restoreBaseState();
+        } catch (...) {
+        }
+        pf_app.resetVoltages();
+        pf_network->updateBuses();
+        contingencyFound = pf_app.setContingency(events[task_id]);
+        islandCount = pf_app.getIslandCount();
+        hasLoneBus = pf_app.hasLoneBus();
+        islandDetected = (islandCount > 1);
+      }
+    }
 #endif
-    if (contingencyFound && !islandDetected) {
+    if (!usedBatchOverlay && contingencyFound && !islandDetected) {
       try {
         solveOk = pf_app.solve();
         if (solveOk && check_Qlim && !pf_app.checkQlimViolations()) {
@@ -2146,6 +2277,34 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     }
     // Return network to its original base case state
     pf_app.unSetContingency(events[task_id]);
+#ifdef GRIDPACK_WITH_CUDSS
+    if (usedBatchOverlay) {
+      try {
+        batchAsm->clearCaseForOutput(batchOverlayIndex,
+                                     batchOutputFullRefresh);
+      } catch (const std::exception& e) {
+        printf("p[%d] batched output cleanup failed for task %d: %s\n",
+               world.rank(), task_id, e.what());
+        batchRankHealthy = false;
+        batchIndexByTask.clear();
+        batchConvByTask.clear();
+        try {
+          batchAsm->restoreBaseState();
+        } catch (...) {
+        }
+      } catch (...) {
+        printf("p[%d] batched output cleanup failed for task %d\n",
+               world.rank(), task_id);
+        batchRankHealthy = false;
+        batchIndexByTask.clear();
+        batchConvByTask.clear();
+        try {
+          batchAsm->restoreBaseState();
+        } catch (...) {
+        }
+      }
+    }
+#endif
     // Clear Q limit violations AFTER unSetContingency so generators are restored first.
     // This ensures clearQlim() sees the correct generator status when deciding
     // whether to restore p_isPV (PV bus status).
@@ -2165,6 +2324,28 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     unsigned long long localDirectFallbackTasks = 0;
     unsigned long long localNonConvergedTasks = 0;
     unsigned long long localControllerFallbackTasks = 0;
+    unsigned long long localAdaptiveRefactors = 0;
+    unsigned long long localScreenedChecks = 0;
+    unsigned long long localBridgeCount = 0;
+    // Construct the expensive base mapper/CSR/scatter/connectivity invariants
+    // once per rank. beginWave() repairs mutable network caches and reuses those
+    // invariants for every subsequent task reservation.
+    try {
+      const std::vector<int> noTasks;
+      batchAsm.reset(new gridpack::powerflow::GridpackBatchAssembler(
+          pf_app, events, noTasks, batchWarmStart, batchDamping,
+          batchConnectivityScreen));
+      localBridgeCount =
+        static_cast<unsigned long long>(batchAsm->bridgeCount());
+    } catch (const std::exception& e) {
+      printf("p[%d] batched GPU initialization failed: %s; this rank will use "
+             "the exact CPU path\n", world.rank(), e.what());
+      batchRankHealthy = false;
+    } catch (...) {
+      printf("p[%d] batched GPU initialization failed; this rank will use "
+             "the exact CPU path\n", world.rank());
+      batchRankHealthy = false;
+    }
     for (;;) {
     // Collect this task communicator's share of the contingencies, then run the
     // branch-eligible subset as cuDSS batches (one shared symbolic analysis) and
@@ -2186,117 +2367,164 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     localInspectedTasks += static_cast<unsigned long long>(myTasks.size());
     batchIndexByTask.clear();
     batchConvByTask.clear();
+    batchConverged.clear();
 
     bool _bprof = (std::getenv("GRIDPACK_BATCH_PROFILE") != NULL);
     double _bt0 = _bprof ? MPI_Wtime() : 0.0;
-    batchAsm.reset(new gridpack::powerflow::GridpackBatchAssembler(
-        pf_app, events, myTasks, batchWarmStart, batchDamping,
-        batchConnectivityScreen));
-    double _bt1 = _bprof ? MPI_Wtime() : 0.0;
-    batchAsm->prepare();
-    if (_bprof && world.rank() == 0) {
-      double _bt2 = MPI_Wtime();
-      fprintf(stderr, "[BATCH_SETUP] ctor=%.2fs prepare=%.2fs (cases=%d)\n",
-              _bt1 - _bt0, _bt2 - _bt1, batchAsm->caseCount());
-    }
+    int Wbatch = 0;
+    int waveDirectFallback = static_cast<int>(myTasks.size());
+    int waveNonConverged = 0;
+    int waveControllerFallback = 0;
+    unsigned long long waveAdaptiveRefactors = 0;
+    bool waveBatchSucceeded = false;
+    if (batchRankHealthy) {
+      try {
+        batchAsm->beginWave(myTasks);
+        double _bt1 = _bprof ? MPI_Wtime() : 0.0;
+        batchAsm->prepare();
+        if (_bprof && world.rank() == 0) {
+          double _bt2 = MPI_Wtime();
+          fprintf(stderr, "[BATCH_SETUP] beginWave=%.2fs prepare=%.2fs "
+                  "(cases=%d)\n", _bt1 - _bt0, _bt2 - _bt1,
+                  batchAsm->caseCount());
+        }
 
-    if (world.rank() == 0 && batchConnectivityScreen) {
-      printf("[connectivity screen] linear-time bridge pass: %d islanding "
-             "line outage(s), %d per-case topology check(s) avoided\n",
-             batchAsm->bridgeCount(), batchAsm->screenSkipped());
-    }
+        if (_bprof && world.rank() == 0 && batchConnectivityScreen) {
+          printf("[connectivity screen] linear-time bridge pass: %d islanding "
+                 "line outage(s), %d per-case topology check(s) avoided\n",
+                 batchAsm->bridgeCount(), batchAsm->screenSkipped());
+        }
 
-    int Wbatch = batchAsm->caseCount();
-    localEligibleTasks += static_cast<unsigned long long>(Wbatch);
-    localDirectFallbackTasks += static_cast<unsigned long long>(
-        batchAsm->nonBatchTaskIds().size());
-    if (Wbatch > 0) {
-      gridpack::powerflow::PFBatchNR nr(*batchAsm, batchTol, batchMaxIter,
-                                        batchRefactorEvery, batchConstantFactor);
-      const std::vector<gridpack::powerflow::BatchCaseStatus>& st = nr.solveWave();
-      batchConverged.assign(Wbatch, 0);
-      for (int k = 0; k < Wbatch; k++) {
-        int tid = batchAsm->batchTaskId(k);
-        batchIndexByTask[tid] = k;
-        batchConverged[k] = st[k].converged ? 1 : 0;
-        gridpack::utility::ConvergenceSummary cs;
-        cs.converged = st[k].converged;
-        cs.iterations = st[k].iterations;
-        cs.finalTolerance = st[k].mismatch;   // inf-norm ||PQ|| (same metric as solve)
-        // The batched engine tracks only the inf-norm mismatch, not the per-bus
-        // P/Q worst-bus split the per-contingency path records.  For a converged
-        // case all per-bus mismatches are < tol (~0); leave the worst-bus
-        // diagnostics 0 rather than mislabel the pu inf-norm as an MW P-mismatch.
-        cs.finalMismatch.maxPBus = 0;
-        cs.finalMismatch.maxPMismatch = 0.0;
-        cs.finalMismatch.maxQBus = 0;
-        cs.finalMismatch.maxQMismatch = 0.0;
-        batchConvByTask[tid] = cs;
-      }
-    }
-    if (world.rank() == 0) {
-      printf("[batched GPU] %d branch contingencies solved in the cuDSS batch "
-             "(1 shared symbolic analysis); %d routed to the per-contingency "
-             "path (generator/islanded/slack-transfer/structure-changed)\n",
-             Wbatch, static_cast<int>(batchAsm->nonBatchTaskIds().size()));
-    }
+        Wbatch = batchAsm->caseCount();
+        waveDirectFallback =
+          static_cast<int>(batchAsm->nonBatchTaskIds().size());
+        if (Wbatch > 0) {
+          gridpack::powerflow::PFBatchNR nr(
+              *batchAsm, batchTol, batchMaxIter, batchRefactorEvery,
+              batchConstantFactor, batchChordCap, batchDamping);
+          const std::vector<gridpack::powerflow::BatchCaseStatus>& st =
+            nr.solveWave();
+          batchConverged.assign(Wbatch, 0);
+          for (int k = 0; k < Wbatch; k++) {
+            int tid = batchAsm->batchTaskId(k);
+            batchIndexByTask[tid] = k;
+            batchConverged[k] = st[k].converged ? 1 : 0;
+            gridpack::utility::ConvergenceSummary cs;
+            cs.converged = st[k].converged;
+            cs.iterations = st[k].iterations;
+            cs.finalTolerance = st[k].mismatch;
+            cs.finalMismatch.maxPBus = st[k].maxPBus;
+            cs.finalMismatch.maxPMismatch = st[k].maxPMismatch;
+            cs.finalMismatch.maxQBus = st[k].maxQBus;
+            cs.finalMismatch.maxQMismatch = st[k].maxQMismatch;
+            batchConvByTask[tid] = cs;
+            waveAdaptiveRefactors += static_cast<unsigned long long>(
+                std::max(0, st[k].refactorizations));
+          }
+        }
+        if (_bprof && world.rank() == 0) {
+          printf("[batched GPU] %d branch contingencies solved in the cuDSS "
+                 "batch (1 shared symbolic analysis); %d routed to the "
+                 "per-contingency path\n", Wbatch, waveDirectFallback);
+        }
 
-    // Robustness: any case that did NOT converge inside the batched wave (e.g.
-    // a chord-Newton stall on an unusually large perturbation) is routed to the
-    // per-contingency solver, which uses exact Newton with line search.
-    if (Wbatch > 0) {
-      int nnc = 0;
-      for (int k = 0; k < Wbatch; k++) {
-        int tid = batchAsm->batchTaskId(k);
-        if (!batchConverged[k] && batchIndexByTask.count(tid)) {
-          batchIndexByTask.erase(tid);
-          batchConvByTask.erase(tid);
-          nnc++;
+        // A non-converged modified-Newton case is always re-solved by the exact
+        // CPU Newton path; no approximate result is emitted.
+        for (int k = 0; k < Wbatch; k++) {
+          int tid = batchAsm->batchTaskId(k);
+          if (!batchConverged[k] && batchIndexByTask.count(tid)) {
+            batchIndexByTask.erase(tid);
+            batchConvByTask.erase(tid);
+            ++waveNonConverged;
+          }
+        }
+        if (_bprof && waveNonConverged && world.rank() == 0) {
+          printf("[batched GPU] %d non-converged case(s) -> exact CPU "
+                 "fallback\n", waveNonConverged);
+        }
+
+        // A local branch/Ybus overlay is sufficient for qlim. Switched shunts
+        // and LTC checks mutate admittance state, so those cases request a full
+        // refresh after the controller state is restored.
+        if (Wbatch > 0 && (check_Qlim || pf_switchedShunt || pf_ltc)) {
+          for (int k = 0; k < Wbatch; k++) {
+            int tid = batchAsm->batchTaskId(k);
+            if (batchIndexByTask.find(tid) == batchIndexByTask.end()) continue;
+            batchAsm->applyCaseForOutput(k, batchOutputFullRefresh);
+            bool ok = true;
+            if (check_Qlim && !pf_app.checkQlimViolations()) ok = false;
+            if (ok && pf_switchedShunt &&
+                !pf_app.checkSwitchedShuntViolations()) ok = false;
+            if (ok && pf_ltc && !pf_app.checkLTCViolations()) ok = false;
+            // Restore controller mutations before rebuilding the base cache.
+            if (check_Qlim) pf_app.clearQlimViolations();
+            if (pf_switchedShunt) pf_app.clearSwitchedShunts();
+            if (pf_ltc) pf_app.clearLTCControls();
+            batchAsm->clearCaseForOutput(k, batchOutputFullRefresh);
+            if (!ok) {
+              batchIndexByTask.erase(tid);
+              batchConvByTask.erase(tid);
+              ++waveControllerFallback;
+            }
+          }
+          if (_bprof && waveControllerFallback && world.rank() == 0) {
+            printf("[batched GPU controllers] %d case(s) hit a qlim/shunt/LTC "
+                   "limit -> exact CPU fallback\n", waveControllerFallback);
+          }
+        }
+        waveBatchSucceeded = true;
+      } catch (const std::exception& e) {
+        printf("p[%d] batched GPU wave failed: %s; all %d tasks will use the "
+               "exact CPU path\n", world.rank(), e.what(),
+               static_cast<int>(myTasks.size()));
+        batchRankHealthy = false;
+        batchIndexByTask.clear();
+        batchConvByTask.clear();
+        batchConverged.clear();
+        try {
+          if (check_Qlim) pf_app.clearQlimViolations();
+          if (pf_switchedShunt) pf_app.clearSwitchedShunts();
+          if (pf_ltc) pf_app.clearLTCControls();
+        } catch (...) {
+        }
+        try {
+          batchAsm->restoreBaseState();
+        } catch (...) {
+        }
+      } catch (...) {
+        printf("p[%d] batched GPU wave failed; all %d tasks will use the exact "
+               "CPU path\n", world.rank(), static_cast<int>(myTasks.size()));
+        batchRankHealthy = false;
+        batchIndexByTask.clear();
+        batchConvByTask.clear();
+        batchConverged.clear();
+        try {
+          if (check_Qlim) pf_app.clearQlimViolations();
+          if (pf_switchedShunt) pf_app.clearSwitchedShunts();
+          if (pf_ltc) pf_app.clearLTCControls();
+        } catch (...) {
+        }
+        try {
+          batchAsm->restoreBaseState();
+        } catch (...) {
         }
       }
-      if (nnc && world.rank() == 0)
-        printf("[batched GPU] %d non-converged case(s) -> per-contingency "
-               "fallback\n", nnc);
-      localNonConvergedTasks += static_cast<unsigned long long>(nnc);
     }
 
-    // Post-wave controller fallback.  A batched case was solved with the base
-    // PV/PQ status and no outer-loop controller.  For each still-batched case,
-    // load its converged state and run the enabled controller checks
-    // (qlim/shunt/LTC); if any would act on the case, drop it from the batched
-    // overlay set so runOneCase() re-solves it with the full controller loop.
-    // qlim uses the fresh p_Qinj that applyCaseForOutput refreshes, so a case is
-    // only re-solved when a generator genuinely crosses a reactive limit (a
-    // handful on Texas7k); the 97% that never switch keep the batched result,
-    // which equals the CPU qlim result exactly (qlim never triggered there).
-    if (Wbatch > 0 && (check_Qlim || pf_switchedShunt || pf_ltc)) {
-      int nredo = 0;
-      for (int k = 0; k < Wbatch; k++) {
-        int tid = batchAsm->batchTaskId(k);
-        if (batchIndexByTask.find(tid) == batchIndexByTask.end()) continue;
-        batchAsm->applyCaseForOutput(k);   // load converged state + refresh Qinj
-        bool ok = true;
-        if (check_Qlim && !pf_app.checkQlimViolations()) ok = false;
-        if (ok && pf_switchedShunt && !pf_app.checkSwitchedShuntViolations())
-          ok = false;
-        if (ok && pf_ltc && !pf_app.checkLTCViolations()) ok = false;
-        batchAsm->clearCaseForOutput(k);   // restore branch topology
-        // Undo any PV/PQ / shunt / tap mutation the checks applied.
-        if (check_Qlim) pf_app.clearQlimViolations();
-        if (pf_switchedShunt) pf_app.clearSwitchedShunts();
-        if (pf_ltc) pf_app.clearLTCControls();
-        if (!ok) {
-          batchIndexByTask.erase(tid);     // -> runOneCase solves it with qlim
-          batchConvByTask.erase(tid);
-          nredo++;
-        }
-      }
-      if (world.rank() == 0)
-        printf("[batched GPU controllers] %d case(s) hit a qlim/shunt/LTC limit "
-               "-> re-solved on the per-contingency path with the full "
-               "controller loop\n", nredo);
+    if (waveBatchSucceeded) {
+      localEligibleTasks += static_cast<unsigned long long>(Wbatch);
+      localDirectFallbackTasks +=
+        static_cast<unsigned long long>(waveDirectFallback);
+      localNonConvergedTasks +=
+        static_cast<unsigned long long>(waveNonConverged);
       localControllerFallbackTasks +=
-        static_cast<unsigned long long>(nredo);
+        static_cast<unsigned long long>(waveControllerFallback);
+      localAdaptiveRefactors += waveAdaptiveRefactors;
+      localScreenedChecks +=
+        static_cast<unsigned long long>(batchAsm->screenSkipped());
+    } else {
+      localDirectFallbackTasks +=
+        static_cast<unsigned long long>(myTasks.size());
     }
 
     // Capture every case (batched cases overlay their converged state inside
@@ -2315,31 +2543,68 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     // identical -- same Newton, different linear solver.
     gridpack::math::setDefaultLinearSolverBackend(
         gridpack::math::LinearSolverBackend::PETSc);
-    for (size_t ti = 0; ti < myTasks.size(); ti++) runOneCase(myTasks[ti]);
+    // Emit all retained GPU states while the assembler's wave-local state is
+    // still current. CPU fallbacks can rebuild global Ybus/Sbus caches, so they
+    // run only after every retained overlay has been captured.
+    std::vector<int> retainedTasks;
+    std::vector<int> fallbackTasks;
+    retainedTasks.reserve(myTasks.size());
+    fallbackTasks.reserve(myTasks.size());
+    for (size_t ti = 0; ti < myTasks.size(); ti++) {
+      if (batchIndexByTask.find(myTasks[ti]) != batchIndexByTask.end())
+        retainedTasks.push_back(myTasks[ti]);
+      else
+        fallbackTasks.push_back(myTasks[ti]);
+    }
+    for (size_t ti = 0; ti < retainedTasks.size(); ti++)
+      runOneCase(retainedTasks[ti]);
+    if (batchAsm) {
+      try {
+        batchAsm->restoreBaseState();
+      } catch (const std::exception& e) {
+        printf("p[%d] failed to restore the batched base state before CPU "
+               "fallbacks: %s\n", world.rank(), e.what());
+        batchRankHealthy = false;
+      } catch (...) {
+        printf("p[%d] failed to restore the batched base state before CPU "
+               "fallbacks\n", world.rank());
+        batchRankHealthy = false;
+      }
+    }
+    for (size_t ti = 0; ti < fallbackTasks.size(); ti++)
+      runOneCase(fallbackTasks[ti]);
     if (noMoreTasks) break;
     }
 
-    unsigned long long localGpuCounts[6] = {
+    unsigned long long localGpuCounts[8] = {
       localGpuWaves,
       localInspectedTasks,
       localEligibleTasks,
       localDirectFallbackTasks,
       localNonConvergedTasks,
-      localControllerFallbackTasks
+      localControllerFallbackTasks,
+      localAdaptiveRefactors,
+      localScreenedChecks
     };
-    unsigned long long globalGpuCounts[6] = {0, 0, 0, 0, 0, 0};
-    MPI_Reduce(localGpuCounts, globalGpuCounts, 6, MPI_UNSIGNED_LONG_LONG,
+    unsigned long long globalGpuCounts[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned long long globalBridgeCount = 0;
+    MPI_Reduce(localGpuCounts, globalGpuCounts, 8, MPI_UNSIGNED_LONG_LONG,
                MPI_SUM, 0, static_cast<MPI_Comm>(world));
+    MPI_Reduce(&localBridgeCount, &globalBridgeCount, 1,
+               MPI_UNSIGNED_LONG_LONG, MPI_MAX, 0,
+               static_cast<MPI_Comm>(world));
     if (world.rank() == 0) {
       const unsigned long long retained =
         globalGpuCounts[2] - globalGpuCounts[4] - globalGpuCounts[5];
       printf("[GPU all-rank summary] ranks=%d waveSize=%d waves=%llu "
              "inspected=%llu eligible=%llu direct_fallback=%llu "
              "nonconverged_fallback=%llu controller_fallback=%llu "
-             "retained_gpu=%llu\n",
+             "retained_gpu=%llu adaptive_refactors=%llu "
+             "screen_checks_avoided=%llu islanding_bridges=%llu\n",
              world.size(), batchWaveSize, globalGpuCounts[0],
              globalGpuCounts[1], globalGpuCounts[2], globalGpuCounts[3],
-             globalGpuCounts[4], globalGpuCounts[5], retained);
+             globalGpuCounts[4], globalGpuCounts[5], retained,
+             globalGpuCounts[6], globalGpuCounts[7], globalBridgeCount);
     }
   } else
 #endif

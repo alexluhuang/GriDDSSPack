@@ -41,6 +41,8 @@
 #include <utility>
 #include <cstdlib>
 #include <cstdio>
+#include <climits>
+#include <cmath>
 #include <chrono>
 #include <boost/shared_ptr.hpp>
 #include <boost/scoped_ptr.hpp>
@@ -94,12 +96,14 @@ public:
       p_damping(damping),
       p_tRestore(0), p_tYbus(0), p_tMapJ(0), p_tCsr(0), p_tMapV(0),
       p_tRhs(0), p_tUpd(0), p_tSnap(0), p_nAsm(0), p_nUpd(0),
-      p_useFast(true), p_screenEnabled(connectivityScreen),
+      p_useFast(true), p_validateFast(false),
+      p_screenEnabled(connectivityScreen),
       p_screenBridgeCount(0)
   {
     // Opt out of the fast assembler (fall back to the GA mapper) for A/B
     // validation via GRIDPACK_BATCH_NOFAST=1.
     if (std::getenv("GRIDPACK_BATCH_NOFAST")) p_useFast = false;
+    p_validateFast = (std::getenv("GRIDPACK_BATCH_VALIDATE") != NULL);
     p_dbg = (std::getenv("GRIDPACK_BATCH_DEBUG") != NULL);
     p_nbus = p_net->numBuses();
 
@@ -138,14 +142,34 @@ public:
     p_baseSig = p_structureSignature();
     {
       gridpack::math::PetscSeqCSRView<gridpack::RealType, int> view(*p_J);
-      p_n   = static_cast<int>(view.rows());
-      p_nnz = static_cast<int>(view.nnz());
+      const PetscInt rows = view.rows();
+      const PetscInt nnz = view.nnz();
+      if (rows < 0 || rows >= static_cast<PetscInt>(INT_MAX) ||
+          nnz < 0 || nnz > static_cast<PetscInt>(INT_MAX)) {
+        throw gridpack::Exception(
+            "pf_batch_ca: reduced Jacobian does not fit 32-bit cuDSS indices");
+      }
+      p_n   = static_cast<int>(rows);
+      p_nnz = static_cast<int>(nnz);
       const PetscInt* ia = view.rowptr();
       const PetscInt* ja = view.colind();
       p_rowptr.resize(p_n + 1);
-      for (int i = 0; i <= p_n; i++) p_rowptr[i] = static_cast<int>(ia[i]);
+      for (int i = 0; i <= p_n; i++) {
+        if (ia[i] < 0 || ia[i] > nnz || (i > 0 && ia[i] < ia[i - 1])) {
+          throw gridpack::Exception("pf_batch_ca: invalid CSR row offsets");
+        }
+        p_rowptr[i] = static_cast<int>(ia[i]);
+      }
+      if (p_rowptr[p_n] != p_nnz) {
+        throw gridpack::Exception("pf_batch_ca: CSR row offsets do not end at nnz");
+      }
       p_colind.resize(p_nnz);
-      for (int i = 0; i < p_nnz; i++) p_colind[i] = static_cast<int>(ja[i]);
+      for (int i = 0; i < p_nnz; i++) {
+        if (ja[i] < 0 || ja[i] >= rows) {
+          throw gridpack::Exception("pf_batch_ca: invalid CSR column index");
+        }
+        p_colind[i] = static_cast<int>(ja[i]);
+      }
     }
     p_corr.assign(p_n, 0.0);
     // Precompute the CSR scatter map (component block -> CSR slot) from the base
@@ -165,6 +189,28 @@ public:
     }
   }
 
+  /// Reuse the immutable base pattern, mapper, scatter map and connectivity
+  /// screen for another rank-local wave.  CPU fallback cases leave cached
+  /// Ybus/Sbus values at their contingency state, so repair those caches once
+  /// here before any local GPU-path patches are applied.
+  void beginWave(const std::vector<int>& taskIds)
+  {
+    p_restoreBaseState();
+    if (p_structureSignature() != p_baseSig) {
+      throw gridpack::Exception(
+          "pf_batch_ca: bus structure did not return to the base signature");
+    }
+    p_taskIds = taskIds;
+  }
+
+  /// Restore all case branches, immutable base voltages, and full base caches.
+  /// Used both at wave boundaries and before routing an exceptional GPU wave to
+  /// the exact CPU path.
+  void restoreBaseState(void)
+  {
+    p_restoreBaseState();
+  }
+
   // -----------------------------------------------------------
   //  Classify this rank's cases into "batchable" vs "fall back to the
   //  per-contingency CPU path".  Must be called once before solveWave().
@@ -175,6 +221,16 @@ public:
     p_batchBranches.clear();
     p_nonBatchTaskIds.clear();
     p_screenSkipped = 0;
+
+    // GRIDPACK_BATCH_NOFAST is an accuracy/reference mode.  Do not send its
+    // cases through the live GPU protocol: the GA mapper restores topology
+    // after each assembly, whereas that protocol intentionally keeps the
+    // outage live between chord steps.  Route every task to the established
+    // exact CPU path instead of mixing the two state machines.
+    if (!p_useFast) {
+      p_nonBatchTaskIds = p_taskIds;
+      return;
+    }
 
     for (size_t t = 0; t < p_taskIds.size(); t++) {
       int tid = p_taskIds[t];
@@ -254,8 +310,6 @@ public:
   {
     ++p_nAsm;
     if (p_useFast) {
-      static bool val = (std::getenv("GRIDPACK_BATCH_VALIDATE") != NULL);
-      if (val && p_nAsm <= 1) p_validateAssemble(k);
       return p_assembleFast(k, jac, rhs);
     }
     auto t0 = BT_T0();
@@ -344,6 +398,7 @@ public:
   // -----------------------------------------------------------
   double assembleLive(int k, double* jac, double* rhs)
   {
+    if (!p_useFast) return assemble(k, jac, rhs);
     ++p_nAsm;
     auto t0 = BT_T0();
     p_restoreCase(k);
@@ -357,11 +412,16 @@ public:
     p_factory->setMode(Jacobian);
     p_fastJac(jac);
     BT_ADD(p_tMapJ, t0);
+    if (p_validateFast) p_validateLiveAssembly(jac, rhs, true);
     return mism;
   }
 
   double updateLive(int k, const double* dx, double* jac, double* rhs)
   {
+    if (!p_useFast) {
+      update(k, dx);
+      return assemble(k, jac, rhs);
+    }
     ++p_nUpd;
     auto t0 = BT_T0();
     for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
@@ -376,13 +436,21 @@ public:
     p_factory->setMode(Jacobian);
     p_fastJac(jac);                        // next Jacobian at the updated state
     BT_ADD(p_tMapJ, t0);
+    if (p_validateFast) p_validateLiveAssembly(jac, rhs, true);
     return mism;
   }
 
   void finishLive(int k)
   {
     p_snapshotCase(k);                     // save converged iterate for output
-    p_localSetYBus(k, true);               // restore base topology for next case
+    if (p_useFast) {
+      p_localSetYBus(k, true);             // restore base topology for next case
+    } else {
+      p_toggleBranches(k, true);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
   }
 
   // -----------------------------------------------------------
@@ -430,6 +498,11 @@ public:
   /// new inf-norm mismatch.
   double updateLiveRhs(int k, const double* dx, double* rhs)
   {
+    if (!p_useFast) {
+      const double mism = update(k, dx);
+      p_extractRhs(rhs);
+      return mism;
+    }
     ++p_nUpd;
     auto t0 = BT_T0();
     for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
@@ -440,8 +513,26 @@ public:
     p_factory->setMode(RHS);
     double mism = p_fastRhs(rhs);
     BT_ADD(p_tMapV, t0);
+    if (p_validateFast) p_validateLiveAssembly(NULL, rhs, false);
     (void)k;
     return mism;
+  }
+
+  void assembleLiveJac(int k, double* jac)
+  {
+    if (p_useFast) {
+      p_factory->setMode(Jacobian);
+      p_fastJac(jac);
+      if (p_validateFast) p_validateLiveAssembly(jac, NULL, true);
+      return;
+    }
+    std::vector<double> rhs(p_n, 0.0);
+    assemble(k, jac, &rhs[0]);
+  }
+
+  BatchMismatchInfo lastMismatch(void) const
+  {
+    return p_lastMismatch;
   }
 
   // -----------------------------------------------------------
@@ -455,27 +546,38 @@ public:
 
   /// Put the network into batched case @c k's converged state + topology so the
   /// driver's writeBusString/writeBranchString capture the right numbers.
-  Contingency& applyCaseForOutput(int k)
+  Contingency& applyCaseForOutput(int k, bool fullRefresh = false)
   {
     p_restoreCase(k);
-    p_toggleBranches(k, false);
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
+    if (fullRefresh) {
+      p_toggleBranches(k, false);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    } else {
+      p_localSetYBus(k, false);
+    }
     // Refresh each bus's p_Pinj/p_Qinj at the converged voltages.  These are
     // recomputed only inside the RHS map (rhsValues); the CPU path gets them
     // from solve(), but the batched overlay skips solve(), so without this the
     // "power" output (generator P/Q, writeStats, csv/json) would report a stale
     // p_Qinj left over from another case in the wave.
     p_factory->setMode(RHS);
-    p_vMap->mapToRealVector(p_PQ);
+    p_fastRhs(NULL);
     return p_events[p_batchTaskIds[k]];
   }
 
   /// Undo applyCaseForOutput(): return the branch(es) to service.
-  void clearCaseForOutput(int k)
+  void clearCaseForOutput(int k, bool fullRefresh = false)
   {
-    p_toggleBranches(k, true);
+    if (fullRefresh) {
+      p_toggleBranches(k, true);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    } else {
+      p_localSetYBus(k, true);
+    }
   }
 
 private:
@@ -484,23 +586,41 @@ private:
   {
     std::vector<int> from, to;
     std::vector<std::pair<int,std::string> > keys;
+    std::vector<int> screenIndex(p_nbus, -1);
+    int activeBusCount = 0;
+    for (int i = 0; i < p_nbus; ++i) {
+      if (!p_net->getActiveBus(i)) continue;
+      PFBus* bus = dynamic_cast<PFBus*>(p_net->getBus(i).get());
+      if (!bus || bus->isIsolated()) continue;
+      screenIndex[i] = activeBusCount++;
+    }
+
     const int nbranch = p_net->numBranches();
     for (int bi = 0; bi < nbranch; ++bi) {
+      if (!p_net->getActiveBranch(bi)) continue;
       PFBranch* branch =
         dynamic_cast<PFBranch*>(p_net->getBranch(bi).get());
       if (!branch) continue;
       int u = -1, v = -1;
       p_net->getBranchEndpoints(bi, &u, &v);
+      if (u < 0 || u >= p_nbus || v < 0 || v >= p_nbus ||
+          screenIndex[u] < 0 || screenIndex[v] < 0) {
+        continue;
+      }
       const std::vector<std::string> tags = branch->getLineIDs();
       for (size_t j = 0; j < tags.size(); ++j) {
         if (!branch->getBranchStatus(tags[j])) continue;
-        from.push_back(u);
-        to.push_back(v);
+        from.push_back(screenIndex[u]);
+        to.push_back(screenIndex[v]);
         keys.push_back(std::make_pair(bi, tags[j]));
       }
     }
-    N1ConnectivityScreen screen(p_nbus, from, to);
+    N1ConnectivityScreen screen(activeBusCount, from, to);
     const int baseComponents = screen.componentsWithout(-1);
+    // The bridge shortcut is authoritative only for a connected active base.
+    // On an already-disconnected base, leave the lookup empty so prepare()
+    // performs GridPACK's complete per-case topology/structure probe.
+    if (baseComponents != 1) return;
     const std::vector<int> outageComponents = screen.screenAllBranchOutages();
     for (size_t e = 0; e < keys.size(); ++e) {
       const bool bridge = outageComponents[e] > baseComponents;
@@ -532,6 +652,17 @@ private:
       if (bus) bus->setVoltageState(p_startV[i], p_startA[i]);
     }
     p_net->updateBuses();
+  }
+
+  void p_restoreBaseState(void)
+  {
+    for (size_t k = 0; k < p_batchBranches.size(); ++k) {
+      p_toggleBranches(static_cast<int>(k), true);
+    }
+    p_restoreStart();
+    p_factory->setYBus();
+    p_factory->setMode(YBus);
+    p_factory->setSBus();
   }
 
   void p_restoreCase(int k)
@@ -591,9 +722,14 @@ private:
   /// CSR slot holding (row,col) in the fixed pattern (build-once linear scan).
   int p_findSlot(int row, int col) const
   {
+    if (row < 0 || row >= p_n || col < 0 || col >= p_n) {
+      throw gridpack::Exception(
+          "pf_batch_ca: component entry is outside the reduced Jacobian");
+    }
     for (int k = p_rowptr[row]; k < p_rowptr[row + 1]; k++)
       if (p_colind[k] == col) return k;
-    return -1;
+    throw gridpack::Exception(
+        "pf_batch_ca: component entry is missing from the base CSR pattern");
   }
 
   /// Precompute the component-block -> CSR-slot map from the base topology (which
@@ -628,6 +764,10 @@ private:
     p_offByMVI.assign(maxmvi + 2, 0);
     for (int m = 0; m <= maxmvi; m++)
       p_offByMVI[m + 1] = p_offByMVI[m] + sizeByMVI[m];
+    if (p_offByMVI.empty() || p_offByMVI.back() != p_n) {
+      throw gridpack::Exception(
+          "pf_batch_ca: component block sizes do not cover the reduced Jacobian");
+    }
 
     // Diagonal (bus) blocks.
     p_diag.clear();
@@ -695,14 +835,27 @@ private:
   double p_fastRhs(double* rhs) const
   {
     double vals[2]; double inf = 0.0;
+    p_lastMismatch = BatchMismatchInfo();
     for (size_t i = 0; i < p_diag.size(); i++) {
       const DiagRec& r = p_diag[i];
-      if (!r.bus->vectorValues(vals)) continue;
+      if (!r.bus->vectorValues(vals)) {
+        throw gridpack::Exception(
+            "pf_batch_ca: RHS structure no longer matches the Jacobian scatter map");
+      }
       for (int t = 0; t < r.vn; t++) {
         double v = vals[t];
         if (rhs) rhs[r.row0 + t] = v;
         double av = v < 0.0 ? -v : v;
         if (av > inf) inf = av;
+        const double engineeringMismatch = av * r.bus->getSBase();
+        if (t == 0 && engineeringMismatch > p_lastMismatch.maxPMismatch) {
+          p_lastMismatch.maxPMismatch = engineeringMismatch;
+          p_lastMismatch.maxPBus = r.bus->getOriginalIndex();
+        } else if (t == 1 &&
+                   engineeringMismatch > p_lastMismatch.maxQMismatch) {
+          p_lastMismatch.maxQMismatch = engineeringMismatch;
+          p_lastMismatch.maxQBus = r.bus->getOriginalIndex();
+        }
       }
     }
     return inf;
@@ -719,16 +872,16 @@ private:
       const DiagRec& r = p_diag[i];
       if (!r.bus->matrixDiagValues(vals)) continue;
       for (int t = 0; t < r.n; t++)
-        if (r.slot[t] >= 0) jac[r.slot[t]] += vals[t];
+        jac[r.slot[t]] += vals[t];
     }
     for (size_t i = 0; i < p_off.size(); i++) {
       const BrRec& r = p_off[i];
       if (r.nf && r.br->matrixForwardValues(vals))
         for (int t = 0; t < r.nf; t++)
-          if (r.fslot[t] >= 0) jac[r.fslot[t]] += vals[t];
+          jac[r.fslot[t]] += vals[t];
       if (r.nr && r.br->matrixReverseValues(vals))
         for (int t = 0; t < r.nr; t++)
-          if (r.rslot[t] >= 0) jac[r.rslot[t]] += vals[t];
+          jac[r.rslot[t]] += vals[t];
     }
   }
 
@@ -778,35 +931,83 @@ private:
     return mism;
   }
 
-  // Diagnostic: assemble case k via BOTH the fast scatter and the GA mapper and
-  // report the max |diff| of the Jacobian values and RHS.  Confirms the fast
-  // assembler reproduces the mapper exactly (at the CSR level, not just output).
-  void p_validateAssemble(int k)
+  // Expensive, opt-in reference check.  The contingency and voltage state are
+  // already live here, so rebuild the same state through GridPACK's GA mappers
+  // and require both the CSR structure and numeric values to match.  This runs
+  // on every requested assembly (GRIDPACK_BATCH_VALIDATE=1), including Release
+  // builds, and fails closed rather than merely printing a warning.
+  void p_validateLiveAssembly(const double* fastJac, const double* fastRhs,
+                              bool checkJac)
   {
-    std::vector<double> jf(p_nnz, 0.0), rf(p_n, 0.0), jg(p_nnz, 0.0), rg(p_n, 0.0);
-    double mf = p_assembleFast(k, &jf[0], &rf[0]);
-    // GA reference (mirror of the non-fast assemble path)
-    p_restoreCase(k);
-    p_toggleBranches(k, false);
-    p_factory->setYBus(); p_factory->setMode(YBus);
-    p_factory->setSBus(); p_factory->setMode(Jacobian);
-    p_jMap->mapToRealMatrix(p_J);
-    {
+    std::vector<double> referenceJac;
+    std::vector<double> referenceRhs;
+
+    p_factory->setYBus();
+    p_factory->setMode(YBus);
+    p_factory->setSBus();
+
+    if (checkJac) {
+      p_factory->setMode(Jacobian);
+      p_jMap->mapToRealMatrix(p_J);
       gridpack::math::PetscSeqCSRView<gridpack::RealType, int> view(*p_J);
-      int gnnz = static_cast<int>(view.nnz());
-      const PetscScalar* a = view.values();
-      for (int i = 0; i < gnnz && i < p_nnz; i++) jg[i] = static_cast<double>(a[i]);
+      if (view.rows() != p_n || view.nnz() != p_nnz) {
+        throw gridpack::Exception(
+            "pf_batch_ca validation: Jacobian dimensions changed");
+      }
+      const PetscInt* ia = view.rowptr();
+      const PetscInt* ja = view.colind();
+      const PetscScalar* values = view.values();
+      referenceJac.resize(p_nnz);
+      for (int i = 0; i <= p_n; ++i) {
+        if (ia[i] != p_rowptr[i]) {
+          throw gridpack::Exception(
+              "pf_batch_ca validation: Jacobian row pattern changed");
+        }
+      }
+      for (int i = 0; i < p_nnz; ++i) {
+        if (ja[i] != p_colind[i]) {
+          throw gridpack::Exception(
+              "pf_batch_ca validation: Jacobian column pattern changed");
+        }
+        referenceJac[i] = static_cast<double>(values[i]);
+      }
+    }
+
+    if (fastRhs) {
+      referenceRhs.resize(p_n);
       p_factory->setMode(RHS);
       p_vMap->mapToRealVector(p_PQ);
+      p_extractRhs(&referenceRhs[0]);
     }
-    double mg = p_extractRhs(&rg[0]);
-    p_toggleBranches(k, true);
-    double dj = 0.0, dr = 0.0;
-    for (int i = 0; i < p_nnz; i++) { double d = jf[i] - jg[i]; if (d < 0) d = -d; if (d > dj) dj = d; }
-    for (int i = 0; i < p_n;   i++) { double d = rf[i] - rg[i]; if (d < 0) d = -d; if (d > dr) dr = d; }
-    std::fprintf(stderr,
-      "[asm-validate] case %d n=%d nnz=%d: max|dJ|=%.3e max|dRHS|=%.3e "
-      "(mism fast=%.4e ga=%.4e)\n", k, p_n, p_nnz, dj, dr, mf, mg);
+
+    double maxDifference = 0.0;
+    double scale = 1.0;
+    if (checkJac) {
+      if (!fastJac) {
+        throw gridpack::Exception(
+            "pf_batch_ca validation: missing fast Jacobian values");
+      }
+      for (int i = 0; i < p_nnz; ++i) {
+        maxDifference =
+          std::max(maxDifference, std::fabs(fastJac[i] - referenceJac[i]));
+        scale = std::max(scale, std::fabs(referenceJac[i]));
+      }
+    }
+    if (fastRhs) {
+      for (int i = 0; i < p_n; ++i) {
+        maxDifference =
+          std::max(maxDifference, std::fabs(fastRhs[i] - referenceRhs[i]));
+        scale = std::max(scale, std::fabs(referenceRhs[i]));
+      }
+    }
+    if (!std::isfinite(maxDifference) || maxDifference > 1.0e-12 * scale) {
+      char message[256];
+      std::snprintf(message, sizeof(message),
+                    "pf_batch_ca validation: fast assembly differs from "
+                    "GridPACK reference (max |difference| %.6e, scale %.6e)",
+                    maxDifference, scale);
+      throw gridpack::Exception(message);
+    }
   }
 
   PFAppModule& p_app;
@@ -838,6 +1039,7 @@ private:
   // Ybus is voltage-independent, so a branch toggle is a LOCAL O(deg) setYBus on
   // the two endpoints instead of a full-network recompute.
   bool p_useFast;                 ///< use the fast scatter path (default true)
+  bool p_validateFast;            ///< compare live fast values with GA reference
   bool p_dbg;                     ///< env-gated convergence trace
   std::vector<int> p_offByMVI;    ///< reduced-J row/col offset per MatVecIndex
   struct DiagRec { PFBus* bus; int row0; int vn; int n; int slot[4]; };
@@ -849,6 +1051,7 @@ private:
   std::vector<int> p_baseSig;
   std::vector<double> p_startV, p_startA;
   std::vector<char> p_isActiveBus;
+  mutable BatchMismatchInfo p_lastMismatch;
 
   // A contingency branch to toggle, with its BASE status for correct restore.
   struct BranchTog {

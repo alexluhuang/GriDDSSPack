@@ -124,6 +124,18 @@ public:
     return assembleLiveRhs(k, rhs);
   }
 
+  void assembleLiveJac(int k, double *jac)
+  {
+    const double x0 = p_x[2*k], x1 = p_x[2*k+1];
+    jac[0] = 2.0*x0; jac[1] = 1.0;
+    jac[2] = 1.0;    jac[3] = 2.0*x1;
+  }
+
+  gridpack::powerflow::BatchMismatchInfo lastMismatch(void) const
+  {
+    return gridpack::powerflow::BatchMismatchInfo();
+  }
+
   // Max over cases of the final residual ||F_k(x_k)||_inf.  Each case has its
   // own (a_k,b_k), so a tiny residual for every case proves the batch solved W
   // DISTINCT nonlinear systems (not the same one W times).  (The system has
@@ -144,6 +156,92 @@ private:
   int p_W;
   int p_rowptr[3], p_colind[4];
   std::vector<double> p_x, p_a, p_b, p_u, p_v;
+};
+
+// A chord iteration whose warm-start Jacobian is deliberately too stale:
+// F(x) = (x0^2 - 4, x1 - 1), x=(1,0).  Holding J(1,0)=diag(2,1)
+// produces x0=2.5 after the first step and then oscillates.  Refreshing at
+// x0=2.5 gives a convergent modified-Newton sequence.
+class StallingChordBatch : public gridpack::powerflow::BatchAssembler
+{
+public:
+  StallingChordBatch(void) : p_x0(1.0), p_x1(0.0)
+  {
+    p_rowptr[0] = 0; p_rowptr[1] = 2; p_rowptr[2] = 4;
+    p_colind[0] = 0; p_colind[1] = 1; p_colind[2] = 0; p_colind[3] = 1;
+  }
+
+  int caseCount(void) const { return 1; }
+  int n(void) const { return 2; }
+  int nnz(void) const { return 4; }
+  const int *rowptr(void) const { return p_rowptr; }
+  const int *colind(void) const { return p_colind; }
+
+  double assemble(int /*k*/, double *jac, double *rhs)
+  {
+    assembleLiveJac(0, jac);
+    return assembleLiveRhs(0, rhs);
+  }
+
+  double update(int /*k*/, const double *dx)
+  {
+    p_x0 += dx[0]; p_x1 += dx[1];
+    double rhs[2];
+    return assembleLiveRhs(0, rhs);
+  }
+
+  double assembleLive(int k, double *jac, double *rhs)
+  {
+    return assemble(k, jac, rhs);
+  }
+
+  double updateLive(int k, const double *dx, double *jac, double *rhs)
+  {
+    update(k, dx);
+    assembleLiveJac(k, jac);
+    return assembleLiveRhs(k, rhs);
+  }
+
+  void finishLive(int /*k*/) {}
+
+  void assembleBaseJac(double *jac)
+  {
+    assembleLiveJac(0, jac);
+  }
+
+  double assembleLiveRhs(int /*k*/, double *rhs)
+  {
+    const double f0 = p_x0*p_x0 - 4.0;
+    const double f1 = p_x1 - 1.0;
+    rhs[0] = -f0; rhs[1] = -f1;
+    return std::max(std::fabs(f0), std::fabs(f1));
+  }
+
+  double updateLiveRhs(int k, const double *dx, double *rhs)
+  {
+    update(k, dx);
+    return assembleLiveRhs(k, rhs);
+  }
+
+  void assembleLiveJac(int /*k*/, double *jac)
+  {
+    jac[0] = 2.0*p_x0; jac[1] = 0.0;
+    jac[2] = 0.0;      jac[3] = 1.0;
+  }
+
+  gridpack::powerflow::BatchMismatchInfo lastMismatch(void) const
+  {
+    return gridpack::powerflow::BatchMismatchInfo();
+  }
+
+  double residual(void) const
+  {
+    return std::max(std::fabs(p_x0*p_x0 - 4.0), std::fabs(p_x1 - 1.0));
+  }
+
+private:
+  int p_rowptr[3], p_colind[4];
+  double p_x0, p_x1;
 };
 
 } // namespace
@@ -167,6 +265,31 @@ int main(int /*argc*/, char ** /*argv*/)
            "max final residual=%.3e\n", W, nconv, maxit, err);
     if (nconv != W || err > 1.0e-8) {
       printf("pf_batch_ca_test: FAILED\n");
+      return 1;
+    }
+
+    StallingChordBatch noRefreshBatch;
+    gridpack::powerflow::PFBatchNR noRefresh(
+        noRefreshBatch, 1.0e-10, 50, 0, true, 50, 1.0, 0);
+    const std::vector<gridpack::powerflow::BatchCaseStatus>& noRefreshStatus =
+      noRefresh.solveWave();
+    if (noRefreshStatus[0].converged) {
+      printf("pf_batch_ca_test: stale chord unexpectedly converged\n");
+      return 1;
+    }
+
+    StallingChordBatch adaptiveBatch;
+    gridpack::powerflow::PFBatchNR adaptive(
+        adaptiveBatch, 1.0e-10, 50, 0, true, 50, 1.0, 2);
+    const std::vector<gridpack::powerflow::BatchCaseStatus>& adaptiveStatus =
+      adaptive.solveWave();
+    printf("pf_batch_ca_test: adaptive chord converged=%d, refreshes=%d, "
+           "residual=%.3e\n", adaptiveStatus[0].converged ? 1 : 0,
+           adaptiveStatus[0].refactorizations, adaptiveBatch.residual());
+    if (!adaptiveStatus[0].converged ||
+        adaptiveStatus[0].refactorizations < 1 ||
+        adaptiveBatch.residual() > 1.0e-8) {
+      printf("pf_batch_ca_test: adaptive chord FAILED\n");
       return 1;
     }
   } catch (const std::exception &e) {
