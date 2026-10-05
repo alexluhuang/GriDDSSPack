@@ -10,16 +10,59 @@ GridPACK CPU result set. It reports:
 - shortest-path angular errors for `ang_from_deg` and `ang_to_deg`;
 - convergence-rate agreement, iteration distributions, mismatch/tolerance
   differences, and status transitions;
-- application and phase timing speedups plus MPI task-load balance.
+- application and legacy-category timing speedups plus MPI task-load balance.
 
 `timing_comparison.csv` marks each row as comparable or diagnostic. Whole-run
-`Total Application` is comparable with stock logs. The six `CA:` common phases
-are compared only when both logs declare the `ca-v2` profiling schema. Legacy
-and `CA GPU:` detail rows retain their raw durations but do not receive a
-speedup, preventing unlike timer scopes from being reported as acceleration.
-The JSON report also sums the six average phase times and reports their coverage
-of average `Total Application`; this exposes a missing phase while allowing for
-the timer's four-decimal log rounding.
+`Total Application` is comparable with stock logs.
+
+New GPU logs declare
+`[profiling] schema=legacy-v1 gpu_legacy_mapping=1`. That capability
+marker enables comparisons for legacy categories into which the optimized path
+explicitly charges equivalent work:
+
+- `Powerflow: Total Application`
+- `Powerflow: Network Parser`
+- `Powerflow: Partition`
+- `Powerflow: Factory Load`
+- `Powerflow: Factory Set Components`
+- `Powerflow: Factory Set Exchange`
+- `Powerflow: Bus Update`
+- `Powerflow: Factory Operations`
+- `Powerflow: Create Mappers`
+- `Powerflow: Map to Matrix`
+- `Powerflow: Map to Vector`
+- `Vector Map: New Vector`
+- `Vector Map: Load Bus Data`
+- `loadBusData: Add Vector Elements`
+- `loadBusData: Fill Buffer`
+- `loadBusData: Add Elements`
+- `Vector Map: Set Vector`
+- `Powerflow: Create Linear Solver`
+- `Powerflow: Solve Linear Equation`
+- `Powerflow: Map to Bus`
+- `mapToBus: get Data`
+- `mapToBus: set Data`
+- `Contingency: Total Application`
+- `Contingency: Write Results`
+
+The stock CPU log does not need a schema marker. Old `ca-v2` GPU logs must not
+receive legacy-category speedups because their optimized work was not charged
+into those labels.
+
+The comparison allowlist uses exact timer names rather than broad prefixes. The
+sole new optimized-path category, `Contingency: Batch Preparation`, has no stock
+counterpart and remains diagnostic. Any unrecognized timer also retains its raw
+duration without a speedup. Nested legacy rows overlap their parents and must
+not be summed; compare the same row across implementations.
+
+The direct GPU assembler charges equivalent work to the parent `Map to Matrix`,
+`Map to Vector`, and `Map to Bus` categories; it does not fabricate calls to
+the lower-level `Vector Map:*`, `loadBusData:*`, or `mapToBus:*` helpers.
+Reductions in those child rows therefore show mapper work that the optimized
+path avoided, not the speed of an equivalent GPU kernel.
+
+The JSON report lists legacy categories found in both logs and categories
+present on only one side.
 
 The 8–9 GB flat CSVs are never merged as one in-memory table. dask-cuDF streams
 each CSV into event-bucketed Parquet partitions, and cuDF compares one bounded

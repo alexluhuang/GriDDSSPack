@@ -42,6 +42,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <boost/scoped_ptr.hpp>
 #include "gridpack/utilities/exception.hpp"
 #include "gridpack/timer/coarse_timer.hpp"
 
@@ -220,19 +221,24 @@ public:
 
     gridpack::utility::CoarseTimer *timer =
       gridpack::utility::CoarseTimer::instance();
-    const int t_solver_setup = timer->createCategory(
-        "CA GPU: Solver Setup and Symbolic Analysis");
-    const int t_host_work = timer->createCategory(
-        "CA GPU: Host Assembly and Update");
+    const int t_create_solver = timer->createCategory(
+        "Powerflow: Create Linear Solver");
     const int t_linear = timer->createCategory(
-        "CA GPU: Numeric Factorization and Triangular Solve");
+        "Powerflow: Solve Linear Equation");
 
-    // One symbolic analysis for the shared base pattern, reused by every case.
-    gridpack::utility::ScopedTimer solverSetupTimer(timer, t_solver_setup);
-    gridpack::math::CuDSSBatchedSolver solver(n, nnz, p_asm.rowptr(),
-                                              p_asm.colind(), 1);
-    solver.analyze();
-    solverSetupTimer.stop();
+    // Match the stock PFAppModule split: constructing/configuring the solver is
+    // "Create Linear Solver", while symbolic analysis is part of the first
+    // direct solve and therefore belongs to "Solve Linear Equation".
+    boost::scoped_ptr<gridpack::math::CuDSSBatchedSolver> solver;
+    {
+      gridpack::utility::ScopedTimer createSolverTimer(timer, t_create_solver);
+      solver.reset(new gridpack::math::CuDSSBatchedSolver(
+          n, nnz, p_asm.rowptr(), p_asm.colind(), 1));
+    }
+    {
+      gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
+      solver->analyze();
+    }
 
     std::vector<double> vals(nnz);
     std::vector<double> rhs(n, 0.0);
@@ -262,18 +268,14 @@ public:
         int adaptiveRefactors = 0;
         int solvesSinceFactor = 0;
         bool previousStepRefactoredForPoorProgress = false;
-        double m = 0.0;
-        {
-          gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-          m = p_asm.assembleLive(k, &vals[0], &rhs[0]);
-        }
+        double m = p_asm.assembleLive(k, &vals[0], &rhs[0]);
         if (m <= p_tol) {
           conv = true;
         } else {
           bool factored = false;
           {
             gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
-            factored = solver.factorizeValues(&vals[0]);
+            factored = solver->factorizeValues(&vals[0]);
           }
           if (factored) {
             const double poorProgressThreshold =
@@ -283,13 +285,10 @@ public:
               bool solved = false;
               {
                 gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
-                solved = solver.solveReuse(&rhs[0], &sol[0]);
+                solved = solver->solveReuse(&rhs[0], &sol[0]);
               }
               if (!solved) break;
-              {
-                gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-                m = p_asm.updateLiveRhs(k, &sol[0], &rhs[0]);
-              }
+              m = p_asm.updateLiveRhs(k, &sol[0], &rhs[0]);
               if (m <= p_tol) { conv = true; ++it; break; }
               if (!std::isfinite(m) || previousMismatch <= 0.0) break;
 
@@ -307,13 +306,10 @@ public:
                   adaptiveRefactors >= p_maxAdaptiveRefactors) break;
 
               if (poorProgress || scheduledRefresh) {
-                {
-                  gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-                  p_asm.assembleLiveJac(k, &vals[0]);
-                }
+                p_asm.assembleLiveJac(k, &vals[0]);
                 {
                   gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
-                  factored = solver.factorizeValues(&vals[0]);
+                  factored = solver->factorizeValues(&vals[0]);
                 }
                 if (!factored) break;
                 ++refactorizations;
@@ -330,12 +326,8 @@ public:
             }
           }
         }
-        BatchMismatchInfo minfo;
-        {
-          gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-          minfo = p_asm.lastMismatch();
-          p_asm.finishLive(k);
-        }
+        BatchMismatchInfo minfo = p_asm.lastMismatch();
+        p_asm.finishLive(k);
         p_status[k].converged = conv;
         p_status[k].iterations = it;
         p_status[k].mismatch = m;
@@ -351,11 +343,7 @@ public:
     for (int k = 0; k < W; ++k) {
       bool conv = false;
       int it = 1;
-      double m = 0.0;
-      {
-        gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-        m = p_asm.assembleLive(k, &vals[0], &rhs[0]);
-      }
+      double m = p_asm.assembleLive(k, &vals[0], &rhs[0]);
       if (m <= p_tol) {
         conv = true;
       } else {
@@ -363,22 +351,15 @@ public:
           bool solved = false;
           {
             gridpack::utility::ScopedTimer linearTimer(timer, t_linear);
-            solved = solver.solveOne(&vals[0], &rhs[0], &sol[0]);
+            solved = solver->solveOne(&vals[0], &rhs[0], &sol[0]);
           }
           if (!solved) break;
-          {
-            gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-            m = p_asm.updateLive(k, &sol[0], &vals[0], &rhs[0]);
-          }
+          m = p_asm.updateLive(k, &sol[0], &vals[0], &rhs[0]);
           if (m <= p_tol) { conv = true; ++it; break; }
         }
       }
-      BatchMismatchInfo minfo;
-      {
-        gridpack::utility::ScopedTimer hostTimer(timer, t_host_work);
-        minfo = p_asm.lastMismatch();
-        p_asm.finishLive(k);
-      }
+      BatchMismatchInfo minfo = p_asm.lastMismatch();
+      p_asm.finishLive(k);
       p_status[k].converged = conv;
       p_status[k].iterations = it;
       p_status[k].mismatch = m;

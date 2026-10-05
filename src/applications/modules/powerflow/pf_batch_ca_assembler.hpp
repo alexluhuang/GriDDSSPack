@@ -63,6 +63,7 @@
 #include "gridpack/math/matrix.hpp"
 #include "gridpack/math/vector.hpp"
 #include "gridpack/math/cudss/cudss_csr_extractor.hpp"
+#include "gridpack/timer/coarse_timer.hpp"
 
 namespace gridpack {
 namespace powerflow {
@@ -92,6 +93,19 @@ public:
       p_factory(app.getFactory()),
       p_events(events),
       p_taskIds(taskIds),
+      p_timer(gridpack::utility::CoarseTimer::instance()),
+      p_timerFactory(
+          p_timer->createCategory("Powerflow: Factory Operations")),
+      p_timerCreateMappers(
+          p_timer->createCategory("Powerflow: Create Mappers")),
+      p_timerMapMatrix(
+          p_timer->createCategory("Powerflow: Map to Matrix")),
+      p_timerMapVector(
+          p_timer->createCategory("Powerflow: Map to Vector")),
+      p_timerMapBus(
+          p_timer->createCategory("Powerflow: Map to Bus")),
+      p_timerBusUpdate(
+          p_timer->createCategory("Powerflow: Bus Update")),
       p_n(0), p_nnz(0), p_nbus(0), p_warmStart(warmStart),
       p_damping(damping),
       p_tRestore(0), p_tYbus(0), p_tMapJ(0), p_tCsr(0), p_tMapV(0),
@@ -110,7 +124,10 @@ public:
     // Snapshot the per-case starting voltages.  For a cold start match the CPU
     // path exactly (raw parser values); otherwise reuse the base solution.
     std::vector<double> startV(p_nbus, 0.0), startA(p_nbus, 0.0);
-    if (!warmStart) p_app.resetVoltages();
+    if (!warmStart) {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      p_app.resetVoltages();
+    }
     p_isActiveBus.assign(p_nbus, 0);
     for (int i = 0; i < p_nbus; i++) {
       p_isActiveBus[i] = p_net->getActiveBus(i) ? 1 : 0;
@@ -129,18 +146,39 @@ public:
     // NOTE: the mappers size themselves from the factory mode AT CONSTRUCTION
     // (exactly like PFAppModule::solve), so vMap must be built after setMode(RHS)
     // and jMap after setMode(Jacobian) -- otherwise the matrix has 0 rows.
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
-    p_factory->setMode(RHS);
-    p_vMap.reset(new gridpack::mapper::BusVectorMap<PFNetwork>(p_net));
-    p_PQ = p_vMap->mapToRealVector();
-    p_factory->setMode(Jacobian);
-    p_jMap.reset(new gridpack::mapper::FullMatrixMap<PFNetwork>(p_net));
-    p_J = p_jMap->mapToRealMatrix();
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
+    {
+      gridpack::utility::ScopedTimer mapperTimer(
+          p_timer, p_timerCreateMappers);
+      p_factory->setMode(RHS);
+      p_vMap.reset(new gridpack::mapper::BusVectorMap<PFNetwork>(p_net));
+    }
+    {
+      gridpack::utility::ScopedTimer mapVectorTimer(
+          p_timer, p_timerMapVector);
+      p_PQ = p_vMap->mapToRealVector();
+    }
+    {
+      gridpack::utility::ScopedTimer mapperTimer(
+          p_timer, p_timerCreateMappers);
+      p_factory->setMode(Jacobian);
+      p_jMap.reset(new gridpack::mapper::FullMatrixMap<PFNetwork>(p_net));
+    }
+    {
+      gridpack::utility::ScopedTimer mapMatrixTimer(
+          p_timer, p_timerMapMatrix);
+      p_J = p_jMap->mapToRealMatrix();
+    }
     p_X.reset(p_PQ->clone());
     p_baseSig = p_structureSignature();
     {
+      gridpack::utility::ScopedTimer mapperTimer(
+          p_timer, p_timerCreateMappers);
       gridpack::math::PetscSeqCSRView<gridpack::RealType, int> view(*p_J);
       const PetscInt rows = view.rows();
       const PetscInt nnz = view.nnz();
@@ -317,16 +355,25 @@ public:
     p_toggleBranches(k, false);          // branch out of service
     BT_ADD(p_tRestore, t0);
     t0 = BT_T0();
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
-    p_factory->setMode(Jacobian);
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
     BT_ADD(p_tYbus, t0);
     t0 = BT_T0();
-    p_jMap->mapToRealMatrix(p_J);        // reassemble into the base allocation
+    {
+      gridpack::utility::ScopedTimer mapMatrixTimer(
+          p_timer, p_timerMapMatrix);
+      p_factory->setMode(Jacobian);
+      p_jMap->mapToRealMatrix(p_J);      // reassemble into the base allocation
+    }
     BT_ADD(p_tMapJ, t0);
     t0 = BT_T0();
     {
+      gridpack::utility::ScopedTimer mapMatrixTimer(
+          p_timer, p_timerMapMatrix);
       gridpack::math::PetscSeqCSRView<gridpack::RealType, int> view(*p_J);
       if (static_cast<int>(view.nnz()) != p_nnz) {
         p_toggleBranches(k, true);
@@ -338,8 +385,12 @@ public:
     }
     BT_ADD(p_tCsr, t0);
     t0 = BT_T0();
-    p_factory->setMode(RHS);
-    p_vMap->mapToRealVector(p_PQ);
+    {
+      gridpack::utility::ScopedTimer mapVectorTimer(
+          p_timer, p_timerMapVector);
+      p_factory->setMode(RHS);
+      p_vMap->mapToRealVector(p_PQ);
+    }
     BT_ADD(p_tMapV, t0);
     t0 = BT_T0();
     double mism = p_extractRhs(rhs);
@@ -359,6 +410,7 @@ public:
     // Newton correction exactly as PFAppModule::solve() does (setValues: p_v/p_a
     // -= dx).
     {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
       PetscInt m = 0;
       PetscScalar* xa =
         gridpack::math::petscVecArray<gridpack::RealType, int>(*p_X, m);
@@ -370,18 +422,32 @@ public:
     }
     BT_ADD(p_tRestore, t0);
     t0 = BT_T0();
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
-    p_factory->setMode(RHS);
-    p_vMap->mapToBus(p_X);
-    p_net->updateBuses();
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
+    {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      p_factory->setMode(RHS);
+      p_vMap->mapToBus(p_X);
+    }
+    {
+      gridpack::utility::ScopedTimer busUpdateTimer(
+          p_timer, p_timerBusUpdate);
+      p_net->updateBuses();
+    }
     BT_ADD(p_tUpd, t0);
     t0 = BT_T0();
     p_snapshotCase(k);                   // save the updated iterate
     BT_ADD(p_tSnap, t0);
     t0 = BT_T0();
-    p_vMap->mapToRealVector(p_PQ);
+    {
+      gridpack::utility::ScopedTimer mapVectorTimer(
+          p_timer, p_timerMapVector);
+      p_vMap->mapToRealVector(p_PQ);
+    }
     BT_ADD(p_tMapV, t0);
     t0 = BT_T0();
     double mism = p_extractRhs(NULL);
@@ -424,9 +490,12 @@ public:
     }
     ++p_nUpd;
     auto t0 = BT_T0();
-    for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
-    for (size_t i = 0; i < p_diag.size(); i++)     // apply Newton step (live)
-      p_diag[i].bus->setValues(&p_corr[p_diag[i].row0]);
+    {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
+      for (size_t i = 0; i < p_diag.size(); i++)   // apply Newton step (live)
+        p_diag[i].bus->setValues(&p_corr[p_diag[i].row0]);
+    }
     BT_ADD(p_tUpd, t0);
     t0 = BT_T0();
     p_factory->setMode(RHS);
@@ -447,6 +516,7 @@ public:
       p_localSetYBus(k, true);             // restore base topology for next case
     } else {
       p_toggleBranches(k, true);
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
       p_factory->setYBus();
       p_factory->setMode(YBus);
       p_factory->setSBus();
@@ -470,9 +540,12 @@ public:
   void assembleBaseJac(double* jac)
   {
     p_restoreStart();                      // base solution voltages
-    p_factory->setYBus();                  // full base YBus (all branches in)
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();                // full base YBus (all branches in)
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
     p_factory->setMode(Jacobian);
     p_fastJac(jac);
   }
@@ -505,9 +578,12 @@ public:
     }
     ++p_nUpd;
     auto t0 = BT_T0();
-    for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
-    for (size_t i = 0; i < p_diag.size(); i++)
-      p_diag[i].bus->setValues(&p_corr[p_diag[i].row0]);
+    {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
+      for (size_t i = 0; i < p_diag.size(); i++)
+        p_diag[i].bus->setValues(&p_corr[p_diag[i].row0]);
+    }
     BT_ADD(p_tUpd, t0);
     t0 = BT_T0();
     p_factory->setMode(RHS);
@@ -551,6 +627,7 @@ public:
     p_restoreCase(k);
     if (fullRefresh) {
       p_toggleBranches(k, false);
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
       p_factory->setYBus();
       p_factory->setMode(YBus);
       p_factory->setSBus();
@@ -572,6 +649,7 @@ public:
   {
     if (fullRefresh) {
       p_toggleBranches(k, true);
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
       p_factory->setYBus();
       p_factory->setMode(YBus);
       p_factory->setSBus();
@@ -646,12 +724,19 @@ private:
 
   void p_restoreStart(void)
   {
-    for (int i = 0; i < p_nbus; i++) {
-      if (!p_isActiveBus[i]) continue;
-      PFBus* bus = dynamic_cast<PFBus*>(p_net->getBus(i).get());
-      if (bus) bus->setVoltageState(p_startV[i], p_startA[i]);
+    {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      for (int i = 0; i < p_nbus; i++) {
+        if (!p_isActiveBus[i]) continue;
+        PFBus* bus = dynamic_cast<PFBus*>(p_net->getBus(i).get());
+        if (bus) bus->setVoltageState(p_startV[i], p_startA[i]);
+      }
     }
-    p_net->updateBuses();
+    {
+      gridpack::utility::ScopedTimer busUpdateTimer(
+          p_timer, p_timerBusUpdate);
+      p_net->updateBuses();
+    }
   }
 
   void p_restoreBaseState(void)
@@ -660,19 +745,29 @@ private:
       p_toggleBranches(static_cast<int>(k), true);
     }
     p_restoreStart();
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
   }
 
   void p_restoreCase(int k)
   {
-    for (int i = 0; i < p_nbus; i++) {
-      if (!p_isActiveBus[i]) continue;
-      PFBus* bus = dynamic_cast<PFBus*>(p_net->getBus(i).get());
-      if (bus) bus->setVoltageState(p_caseV[k][i], p_caseA[k][i]);
+    {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      for (int i = 0; i < p_nbus; i++) {
+        if (!p_isActiveBus[i]) continue;
+        PFBus* bus = dynamic_cast<PFBus*>(p_net->getBus(i).get());
+        if (bus) bus->setVoltageState(p_caseV[k][i], p_caseA[k][i]);
+      }
     }
-    p_net->updateBuses();
+    {
+      gridpack::utility::ScopedTimer busUpdateTimer(
+          p_timer, p_timerBusUpdate);
+      p_net->updateBuses();
+    }
   }
 
   void p_snapshotCase(int k)
@@ -693,6 +788,7 @@ private:
   // no-op, never a spurious energization).
   void p_toggleBranches(int k, bool inService)
   {
+    gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
     const std::vector<BranchTog>& brs = p_batchBranches[k];
     for (size_t j = 0; j < brs.size(); j++) {
       brs[j].br->setBranchStatus(brs[j].tag, inService ? brs[j].baseStatus : false);
@@ -701,6 +797,7 @@ private:
 
   double p_extractRhs(double* rhs)
   {
+    gridpack::utility::ScopedTimer mapVectorTimer(p_timer, p_timerMapVector);
     PetscInt m = 0;
     const PetscScalar* a =
       gridpack::math::petscVecArrayRead<gridpack::RealType, int>(*p_PQ, m);
@@ -736,9 +833,14 @@ private:
   /// is exactly the fixed pattern captured in the ctor).  Runs once.
   void p_buildScatterMap(void)
   {
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
+    gridpack::utility::ScopedTimer mapperTimer(
+        p_timer, p_timerCreateMappers);
     p_factory->setMode(Jacobian);
 
     // Row/col offset per MatVecIndex = prefix sum of block sizes over lower
@@ -816,6 +918,7 @@ private:
   /// so this is exact; getPQ later refreshes p_theta from the live angles.
   void p_localSetYBus(int k, bool inService)
   {
+    gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
     const std::vector<BranchTog>& brs = p_batchBranches[k];
     for (size_t j = 0; j < brs.size(); j++) {
       brs[j].br->setBranchStatus(brs[j].tag,
@@ -834,6 +937,7 @@ private:
   /// mismatch (if rhs != NULL) and returns its inf-norm.
   double p_fastRhs(double* rhs) const
   {
+    gridpack::utility::ScopedTimer mapVectorTimer(p_timer, p_timerMapVector);
     double vals[2]; double inf = 0.0;
     p_lastMismatch = BatchMismatchInfo();
     for (size_t i = 0; i < p_diag.size(); i++) {
@@ -866,6 +970,7 @@ private:
   /// the zero set by std::fill, exactly reproducing the removed contribution.
   void p_fastJac(double* jac) const
   {
+    gridpack::utility::ScopedTimer mapMatrixTimer(p_timer, p_timerMapMatrix);
     std::fill(jac, jac + p_nnz, 0.0);
     double vals[4];
     for (size_t i = 0; i < p_diag.size(); i++) {
@@ -910,11 +1015,15 @@ private:
     auto t0 = BT_T0();
     p_restoreCase(k);
     p_localSetYBus(k, false);
-    for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
-    // Apply the Newton correction directly (replaces GA mapToBus): each
-    // contributing bus consumes p_corr[row0 .. row0+size-1] via PFBus::setValues.
-    for (size_t i = 0; i < p_diag.size(); i++)
-      p_diag[i].bus->setValues(&p_corr[p_diag[i].row0]);
+    {
+      gridpack::utility::ScopedTimer mapBusTimer(p_timer, p_timerMapBus);
+      for (int i = 0; i < p_n; i++) p_corr[i] = dx[i] * p_damping;
+      // Apply the Newton correction directly (replaces GA mapToBus): each
+      // contributing bus consumes p_corr[row0 .. row0+size-1] via
+      // PFBus::setValues.
+      for (size_t i = 0; i < p_diag.size(); i++)
+        p_diag[i].bus->setValues(&p_corr[p_diag[i].row0]);
+    }
     BT_ADD(p_tUpd, t0);
     t0 = BT_T0();
     p_snapshotCase(k);
@@ -942,13 +1051,22 @@ private:
     std::vector<double> referenceJac;
     std::vector<double> referenceRhs;
 
-    p_factory->setYBus();
-    p_factory->setMode(YBus);
-    p_factory->setSBus();
+    {
+      gridpack::utility::ScopedTimer factoryTimer(p_timer, p_timerFactory);
+      p_factory->setYBus();
+      p_factory->setMode(YBus);
+      p_factory->setSBus();
+    }
 
     if (checkJac) {
-      p_factory->setMode(Jacobian);
-      p_jMap->mapToRealMatrix(p_J);
+      {
+        gridpack::utility::ScopedTimer mapMatrixTimer(
+            p_timer, p_timerMapMatrix);
+        p_factory->setMode(Jacobian);
+        p_jMap->mapToRealMatrix(p_J);
+      }
+      gridpack::utility::ScopedTimer mapMatrixTimer(
+          p_timer, p_timerMapMatrix);
       gridpack::math::PetscSeqCSRView<gridpack::RealType, int> view(*p_J);
       if (view.rows() != p_n || view.nnz() != p_nnz) {
         throw gridpack::Exception(
@@ -975,8 +1093,12 @@ private:
 
     if (fastRhs) {
       referenceRhs.resize(p_n);
-      p_factory->setMode(RHS);
-      p_vMap->mapToRealVector(p_PQ);
+      {
+        gridpack::utility::ScopedTimer mapVectorTimer(
+            p_timer, p_timerMapVector);
+        p_factory->setMode(RHS);
+        p_vMap->mapToRealVector(p_PQ);
+      }
       p_extractRhs(&referenceRhs[0]);
     }
 
@@ -1015,6 +1137,13 @@ private:
   boost::shared_ptr<PFFactoryModule> p_factory;
   std::vector<Contingency>& p_events;
   std::vector<int> p_taskIds;
+  gridpack::utility::CoarseTimer* p_timer;
+  int p_timerFactory;
+  int p_timerCreateMappers;
+  int p_timerMapMatrix;
+  int p_timerMapVector;
+  int p_timerMapBus;
+  int p_timerBusUpdate;
 
   boost::scoped_ptr<gridpack::mapper::FullMatrixMap<PFNetwork> > p_jMap;
   boost::scoped_ptr<gridpack::mapper::BusVectorMap<PFNetwork> > p_vMap;

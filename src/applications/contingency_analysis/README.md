@@ -78,64 +78,86 @@ disconnecting single-line outages without a topology traversal per case.
 
 ### Performance profiling
 
-Successful runs print `[profiling] schema=ca-v2` followed by the existing
-GridPACK timer categories and six common, non-overlapping CA phases:
+Successful runs print
+`[profiling] schema=legacy-v1 gpu_legacy_mapping=1`. The stock GridPACK
+`Powerflow:*`, `Vector Map:*`, `loadBusData:*`, `mapToBus:*`, and
+`Contingency:*` category names are preserved. There are no separate `CA:*` or
+`CA GPU:*` timer trees. An operation contributes to the same legacy category
+regardless of whether GridPACK performs it through the established
+PETSc/mapper path or through the direct GPU path.
 
-| Category | Inclusive scope |
+The legacy categories receive the following equivalent GPU work:
+
+| Legacy category | CPU and GPU meaning |
 |---|---|
-| `CA: Configuration` | Input XML, runtime options, backend selection |
-| `CA: Model and Output Setup` | Network read/initialize and output metadata |
-| `CA: Base Case` | Base solve and base-result capture |
-| `CA: Contingency Setup` | N-1 construction, task/statistics setup, GPU options |
-| `CA: Contingency Processing` | Task dispatch, all CPU/GPU solves, case output |
-| `CA: Result Finalization` | Flat-file close/drain, sidecars, convergence, statistics |
+| `Powerflow: Total Application` | All established power-flow work plus equivalent nonlinear-solve and controller-validation work performed by the GPU path |
+| `Powerflow: Factory Operations` | Full `setYBus`/`setSBus` operations or the GPU path's exact local Y-bus endpoint updates |
+| `Powerflow: Create Mappers` | Equation/component mapping, including construction of the fixed CSR pattern and direct component-to-CSR scatter locations |
+| `Powerflow: Map to Matrix` | Assembly of numeric Jacobian values, whether through a GridPACK matrix mapper or directly into CSR storage |
+| `Powerflow: Map to Vector` | Assembly of the power-mismatch/residual right-hand side |
+| `Powerflow: Create Linear Solver` | Construction of the PETSc or cuDSS solver objects, descriptors, and required buffers |
+| `Powerflow: Solve Linear Equation` | Structural analysis when deferred by the solver, numeric factorization, triangular solve, and required host/device transfers |
+| `Powerflow: Map to Bus` | Applying a Newton correction or a saved converged GPU state to bus voltage and angle values |
+| `Powerflow: Bus Update` | Actual network bus-update/exchange calls |
+| `Contingency: Total Application` | Structured result collection and result-production work, including the direct flat-output path |
+| `Contingency: Write Results` | Structured result collection, result formatting, foreground submission or synchronous writing, final close/drain waits, and output sidecars |
 
-These phase boundaries are the same for CPU-only, optimized CPU, and opt-in
-GPU execution. Together they account for the timed portion of
-`CADriver::execute`; use the `Maximum time` values only for phase-level
-critical-path analysis, because maxima may come from different MPI ranks and
-must not be summed. `Total Application` remains the backwards-compatible
-cross-version wall-time comparison.
+cuDSS symbolic analysis is charged to `Powerflow: Solve Linear Equation`, not
+`Powerflow: Create Linear Solver`. This matches the legacy PETSc path, where
+ordering and factorization may be deferred until the first `solve()` call.
+Likewise, direct CSR and residual assembly are charged to the legacy
+`Map to Matrix` and `Map to Vector` categories even though the GPU path avoids
+constructing a mapper object on every iteration.
 
-The narrower `CA:` rows explain work inside those phases:
+The model-loading categories (`Powerflow: Network Parser`, `Partition`,
+`Factory Load`, `Factory Set Components`, and `Factory Set Exchange`) already
+measure shared startup work and need no synthetic GPU contribution. The
+low-level `Vector Map:*`, `loadBusData:*`, and `mapToBus:*` rows continue to
+measure calls to those specific legacy mapper implementations. The direct GPU
+assembler intentionally bypasses them, so use their parent
+`Powerflow: Map to Vector` and `Powerflow: Map to Bus` rows for cross-path
+comparisons.
 
-| Detail category | Scope |
-|---|---|
-| `CA: Task Dispatch` | Waiting for and claiming distributed work |
-| `CA: Case Setup` | Applying a contingency and checking islands/slack transfer |
-| `CA: Exact Per-Case Solve` | Full CPU/PETSc solve for ordinary and fallback cases |
-| `CA: Case Evaluation and Output` | Limits, result capture, formatting calls, and statistics |
-| `CA: Case Restore` | Undoing contingency, controller, and slack state |
-| `CA: Flat Result Formatting` | Constructing flat CSV rows |
-| `CA: Flat Output Submit` | Direct write, memory append, or async-writer enqueue |
-| `CA: Flat Output Finalize` | Writer drain/close, MPI-IO, concatenation, and bus sidecar |
-| `CA: Convergence Output` | Gathering, sorting, and writing convergence rows |
+`Contingency: Batch Preparation` is the only new timer category. It covers work
+with no stock per-contingency CPU equivalent: GPU eligibility classification,
+connectivity/bridge screening, and wave snapshot/state staging. Reusable
+equation and CSR/scatter construction within preparation also contributes to
+the appropriate legacy `Powerflow: Create Mappers` row. Consequently,
+`Contingency: Batch Preparation` is a diagnostic, not a value to add to the
+legacy operation totals.
 
-Detail categories are nested beneath the six phases and sometimes beneath one
-another, so they must not be added to the phase totals.
+Legacy categories accumulate several disjoint call sites and are not a
+non-overlapping partition of `Total Application`. Child rows overlap their
+parent rows, and the batch-preparation diagnostic can overlap mapped setup
+work. Do not add categories together. Configuration, task dispatch, case
+setup/restoration, result checks, and final bookkeeping that have no legacy
+child category remain covered only by `Total Application`.
 
-The older `Powerflow:*`, `Vector Map:*`, and `Contingency:*` categories remain
-unchanged so existing log consumers continue to work. They are implementation
-diagnostics, not cross-path phases: in particular, `Contingency: Write Results`
-measures the legacy SerialIO string helper and does not include the direct
-`csv_flat` formatter or shared-file append.
+The mapping preserves the meaning of an operation, not the number of times it
+must run. For example, the chord-Newton path can reuse a numeric factorization,
+and all cases in a wave share one structural analysis. A reduction in
+`Powerflow: Solve Linear Equation` therefore includes avoided work as well as
+faster GPU work; it is not a per-factorization kernel benchmark. CPU fallbacks
+also contribute to the same rows, so the measured GPU profile represents the
+actual mixed execution path for that network and contingency list.
 
-`CA GPU:*` categories break down the GPU implementation beneath
-`CA: Contingency Processing`. They have no stock-CPU equivalent and should not
-be interpreted as CPU/GPU speedup rows. They cover invariant construction,
-wave preparation and eligibility screening, the complete batched Newton solve,
-controller checks, result overlay, and restoration. Within batched Newton,
-separate rows cover solver/symbolic setup, host matrix/residual work, and
-numeric factorization/triangular solves.
+The asynchronous flat-file writer cannot safely call `CoarseTimer` from its
+background thread. `Contingency: Write Results` measures foreground formatting
+and queue submission plus any wait needed when the writer is closed. I/O that
+finishes entirely in the background while power-flow work continues is visible
+in end-to-end `Total Application`, but its overlapped duration is not added
+again to `Contingency: Write Results`.
 
-`CA GPU: Batch Newton` is the authoritative wall-time scope for the complete
-batched solve. cuDSS
-factorization and solve launches are asynchronous; their required blocking
-device-to-host result copy keeps the aggregate
-`CA GPU: Numeric Factorization and Triangular Solve` time representative, but
-an individual launch's work can be charged at the following synchronization
-point. The detail row is therefore a bottleneck guide, not a standalone GPU
-kernel benchmark.
+For comparisons, use:
+
+1. `Total Application` for end-to-end elapsed time.
+2. `Powerflow: Total Application` and `Contingency: Total Application` for
+   subsystem-level comparisons.
+3. Matching legacy operation rows to explain where those subsystem totals
+   differ.
+
+Compare runs only when network, contingency list, MPI rank count, solver
+tolerance, controller settings, monitored-result set, and output mode match.
 
 For `csv_flat`, `sharedFlatFile=true` (the default) lets ranks append complete
 case blocks to one file while computation continues. `bufferFlatOutput=true`

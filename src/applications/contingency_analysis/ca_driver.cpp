@@ -365,58 +365,42 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   int t_total = timer->createCategory("Total Application");
   timer->start(t_total);
 
-  // Compatibility-preserving CA profile. The legacy GridPACK categories below
-  // remain unchanged; these six non-overlapping phases partition the successful
-  // CADriver::execute interval so CPU, optimized CPU, and GPU runs have common
-  // apples-to-apples boundaries.
-  int t_ca_config = timer->createCategory("CA: Configuration");
-  int t_ca_model_setup =
-    timer->createCategory("CA: Model and Output Setup");
-  int t_ca_base = timer->createCategory("CA: Base Case");
-  int t_ca_contingency_setup =
-    timer->createCategory("CA: Contingency Setup");
-  int t_ca_processing =
-    timer->createCategory("CA: Contingency Processing");
-  int t_ca_finalization =
-    timer->createCategory("CA: Result Finalization");
+  // Pre-create the stock GridPACK categories in their established order on
+  // every rank. CoarseTimer reduces by numeric category index, so conditional
+  // first creation can otherwise associate different names on different ranks.
+  int t_pf_total =
+    timer->createCategory("Powerflow: Total Application");
+  timer->createCategory("Powerflow: Network Parser");
+  timer->createCategory("Powerflow: Partition");
+  timer->createCategory("Powerflow: Factory Load");
+  timer->createCategory("Powerflow: Factory Set Components");
+  timer->createCategory("Powerflow: Factory Set Exchange");
+  timer->createCategory("Powerflow: Bus Update");
+  timer->createCategory("Powerflow: Factory Operations");
+  timer->createCategory("Powerflow: Create Mappers");
+  timer->createCategory("Powerflow: Map to Matrix");
+  timer->createCategory("Powerflow: Map to Vector");
+  timer->createCategory("Vector Map: New Vector");
+  timer->createCategory("Vector Map: Load Bus Data");
+  timer->createCategory("loadBusData: Add Vector Elements");
+  timer->createCategory("loadBusData: Fill Buffer");
+  timer->createCategory("loadBusData: Add Elements");
+  timer->createCategory("Vector Map: Set Vector");
+  timer->createCategory("Powerflow: Create Linear Solver");
+  timer->createCategory("Powerflow: Solve Linear Equation");
+  timer->createCategory("Powerflow: Map to Bus");
+  timer->createCategory("mapToBus: get Data");
+  timer->createCategory("mapToBus: set Data");
+  int t_contingency_total =
+    timer->createCategory("Contingency: Total Application");
+  int t_contingency_write =
+    timer->createCategory("Contingency: Write Results");
 
-  // Common implementation detail. These categories retain identical meanings
-  // on the CPU-only and GPU-with-fallback paths.
-  int t_ca_task_dispatch = timer->createCategory("CA: Task Dispatch");
-  int t_ca_case_setup = timer->createCategory("CA: Case Setup");
-  int t_ca_exact_solve =
-    timer->createCategory("CA: Exact Per-Case Solve");
-  int t_ca_case_output =
-    timer->createCategory("CA: Case Evaluation and Output");
-  int t_ca_case_restore = timer->createCategory("CA: Case Restore");
-  int t_ca_flat_format =
-    timer->createCategory("CA: Flat Result Formatting");
-  int t_ca_flat_submit = timer->createCategory("CA: Flat Output Submit");
-  int t_ca_flat_finalize =
-    timer->createCategory("CA: Flat Output Finalize");
-  int t_ca_convergence_output =
-    timer->createCategory("CA: Convergence Output");
-
-  // GPU-specific diagnostics. They are deliberately separate from the common
-  // CA phases and must not be compared directly with legacy CPU categories.
-  int t_ca_gpu_invariants =
-    timer->createCategory("CA GPU: Invariant Setup");
-  int t_ca_gpu_wave_prepare =
-    timer->createCategory("CA GPU: Wave Preparation");
-  int t_ca_gpu_batch_newton =
-    timer->createCategory("CA GPU: Batch Newton");
-  int t_ca_gpu_controllers =
-    timer->createCategory("CA GPU: Controller Checks");
-  int t_ca_gpu_overlay =
-    timer->createCategory("CA GPU: Result Overlay");
-  int t_ca_gpu_restore =
-    timer->createCategory("CA GPU: State Restore");
-  timer->createCategory("CA GPU: Solver Setup and Symbolic Analysis");
-  timer->createCategory("CA GPU: Host Assembly and Update");
-  timer->createCategory(
-      "CA GPU: Numeric Factorization and Triangular Solve");
-
-  timer->start(t_ca_config);
+  // Eligibility screening and wave staging have no truthful stock category.
+  // This one diagnostic may overlap fixed-structure work that is also charged
+  // to its equivalent legacy Powerflow category.
+  int t_batch_preparation =
+    timer->createCategory("Contingency: Batch Preparation");
 
   // Read configuration file (user specified, otherwise assume that it is
   // call input.xml)
@@ -604,8 +588,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // - When check_Qlim = true: output uses p_qg (set by chkQlim())
   gridpack::powerflow::PFBus::setQlim(check_Qlim);
   gridpack::powerflow::PFBus::setQlimDeadband(qlim_deadband);
-  timer->stop(t_ca_config);
-  timer->start(t_ca_model_setup);
   gridpack::parallel::Communicator task_comm = world.divide(grp_size);
 
   // Create powerflow applications on each task communicator
@@ -671,6 +653,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   };
   std::map<int, BusMeta> bus_meta;
   if (wantBusSidecar) {
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
     int nBus = pf_network->numBuses();
     for (int i = 0; i < nBus; i++) {
       gridpack::powerflow::PFBus *bus =
@@ -709,6 +693,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 
   // Per-rank bus metadata sidecar (deduped by world rank 0 after the loop).
   if (wantBusSidecar) {
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer outputWriteTimer(
+        timer, t_contingency_write);
     std::ostringstream oss;
     oss << outputFile << "_buses." << world.rank() << ".part";
     std::ofstream fbus(oss.str().c_str(),
@@ -738,6 +726,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     "p_from_mw,q_from_mvar,mva_from,rate_mva,loading_percent,"
     "viol,v_from_pu,v_to_pu,ang_from_deg,ang_to_deg\n";
   if (outputFormat == "csv_flat") {
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer outputWriteTimer(
+        timer, t_contingency_write);
     if (bufferFlatOutput) {
       // Finalized with disjoint MPI-IO writes after the contingency loop.
     } else if (sharedFlatFile) {
@@ -1020,7 +1012,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
                              bool emit, bool is_base) {
     if (task_comm.size() == 1 && !std::getenv("GRIDPACK_FLAT_LEGACY")) {
       if (!emit) return;
-      gridpack::utility::ScopedTimer formatTimer(timer, t_ca_flat_format);
+      gridpack::utility::ScopedTimer outputTotalTimer(
+          timer, t_contingency_total);
+      gridpack::utility::ScopedTimer outputWriteTimer(
+          timer, t_contingency_write);
       std::string frow;
       frow.reserve(static_cast<size_t>(pf_network->numBranches()) * 160);
       std::ostringstream prefixStream;
@@ -1103,15 +1098,19 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
           ++flatRowCount;
         }
       }
-      formatTimer.stop();
-      gridpack::utility::ScopedTimer submitTimer(timer, t_ca_flat_submit);
       writeFlatBlock(frow);
       return;
     }
-    gridpack::utility::ScopedTimer formatTimer(timer, t_ca_flat_format);
     std::vector<std::string> v_strs = pf_app.writeBusString("vr_str");
     std::vector<std::string> b_strs = pf_app.writeBranchString("flow_str");
     if (!emit || task_comm.rank() != 0) return;
+    // writeBusString/writeBranchString time themselves with these same legacy
+    // categories. Start a disjoint scope here because CoarseTimer categories
+    // are not reentrant.
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer outputWriteTimer(
+        timer, t_contingency_write);
     // Buffer this contingency's rows into one block, then hand it to the writer
     // (Phase-5 I/O overlap).  Formatted with snprintf into a preallocated string
     // -- numerically identical to the old ostringstream(std::fixed) path but far
@@ -1183,8 +1182,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
                     ang_from_deg, ang_to_deg);
       flatRowCount++;
     }
-    formatTimer.stop();
-    gridpack::utility::ScopedTimer submitTimer(timer, t_ca_flat_submit);
     writeFlatBlock(frow);
   };
 
@@ -1196,6 +1193,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     std::vector<std::string> v_strs = pf_app.writeBusString("vr_str");
     std::vector<std::string> b_strs = pf_app.writeBranchString("flow_str");
     if (task_comm.rank() != 0) return;
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer outputWriteTimer(
+        timer, t_contingency_write);
     std::map<int, std::pair<double,double> > vbymag_ang;
     for (size_t vi = 0; vi < v_strs.size(); vi++) {
       int    bus_id = 0, use_vmag = 0, changed = 0;
@@ -1271,6 +1272,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     std::vector<std::string> v_strs = pf_app.writeBusString("vr_str");
     std::vector<std::string> b_strs = pf_app.writeBranchString("flow_str");
     if (!emit || task_comm.rank() != 0) return;
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer outputWriteTimer(
+        timer, t_contingency_write);
     if (!deltaPart.is_open()) {
       deltaPart.open(deltaPartPath.c_str(), std::ios::out | std::ios::trunc);
       deltaPart << std::fixed;
@@ -1377,9 +1382,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     }
   };
 
-  timer->stop(t_ca_model_setup);
-  timer->start(t_ca_base);
-
   //  Set minimum and maximum voltage limits on all buses
   pf_app.setVoltageLimits(Vmin, Vmax);
   // Solve the base power flow on every task communicator. Abort if it fails.
@@ -1423,6 +1425,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // in the hot loop and skips the heavyweight collectResults() path.
   gridpack::utility::PowerFlowResults baseCaseResults;
   if (outputFormat == "json" || outputFormat == "csv") {
+    gridpack::utility::ScopedTimer outputTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer outputWriteTimer(
+        timer, t_contingency_write);
     baseCaseResults = pf_app.collectResults();
   }
   if (outputFormat == "csv_flat") {
@@ -1436,9 +1442,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     // Cache base-case branch state on every rank for the contingency join.
     populateBaseCache();
   }
-
-  timer->stop(t_ca_base);
-  timer->start(t_ca_contingency_setup);
 
   // Check if auto-generation of N-1 contingencies is enabled
   // FullBranchN1: generate N-1 contingencies for all branches
@@ -1935,7 +1938,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // result, capture, restore) is one lambda so the CPU per-contingency loop and
   // the GPU batched path drive IDENTICAL setup/capture/teardown.
   auto runOneCase = [&](int task_id) {
-    gridpack::utility::ScopedTimer caseSetupTimer(timer, t_ca_case_setup);
     if (print_calcs) printf("Executing task %d on process %d\n",task_id,world.rank());
     // Trim trailing spaces from contingency name for filename
     std::string fname = events[task_id].p_name;
@@ -1994,11 +1996,10 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     bool solveOk = false;
     bool usedBatchOverlay = false;
     int batchOverlayIndex = -1;
-    caseSetupTimer.stop();
 #ifdef GRIDPACK_WITH_CUDSS
     std::map<int,int>::iterator _bit = batchIndexByTask.find(task_id);
     if (_bit != batchIndexByTask.end()) {
-      gridpack::utility::ScopedTimer overlayTimer(timer, t_ca_gpu_overlay);
+      gridpack::utility::ScopedTimer overlayTimer(timer, t_pf_total);
       try {
         // Pre-solved by the GPU batch: overlay its converged state (the branch
         // is already out of service from setContingency above) rather than
@@ -2056,7 +2057,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     }
 #endif
     if (!usedBatchOverlay && contingencyFound && !islandDetected) {
-      gridpack::utility::ScopedTimer exactSolveTimer(timer, t_ca_exact_solve);
       try {
         solveOk = pf_app.solve();
         if (solveOk && check_Qlim && !pf_app.checkQlimViolations()) {
@@ -2071,7 +2071,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         solveOk = false;
       }
     }
-    gridpack::utility::ScopedTimer caseOutputTimer(timer, t_ca_case_output);
     if (solveOk) {
       // Write PV->PQ conversion warnings to output file
       if (print_calcs && check_Qlim) {
@@ -2114,7 +2113,13 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
           ctResult.type = (events[task_id].p_type == Branch) ? "branch" : "generator";
           ctResult.hasVoltageViolation = !ok1;
           ctResult.hasBranchViolation = !ok2;
-          ctResult.solution = pf_app.collectResults();
+          {
+            gridpack::utility::ScopedTimer outputTotalTimer(
+                timer, t_contingency_total);
+            gridpack::utility::ScopedTimer outputWriteTimer(
+                timer, t_contingency_write);
+            ctResult.solution = pf_app.collectResults();
+          }
           localContingencies.push_back(ctResult);
         }
         if (outputFormat == "csv_flat") {
@@ -2347,12 +2352,11 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         timer->stop(t_store);
       }
     }
-    caseOutputTimer.stop();
-    gridpack::utility::ScopedTimer caseRestoreTimer(timer, t_ca_case_restore);
     // Return network to its original base case state
     pf_app.unSetContingency(events[task_id]);
 #ifdef GRIDPACK_WITH_CUDSS
     if (usedBatchOverlay) {
+      gridpack::utility::ScopedTimer restoreTimer(timer, t_pf_total);
       try {
         batchAsm->clearCaseForOutput(batchOverlayIndex,
                                      batchOutputFullRefresh);
@@ -2389,8 +2393,6 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     if (print_calcs) pf_app.close();
   };  // end runOneCase
 
-  timer->stop(t_ca_contingency_setup);
-  timer->start(t_ca_processing);
 #ifdef GRIDPACK_WITH_CUDSS
   if (_tsp && world.rank()==0) fprintf(stderr,"[TS] preContingency %.2fs\n", MPI_Wtime()-_ts0);
   if (useBatched) {
@@ -2407,7 +2409,9 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     // once per rank. beginWave() repairs mutable network caches and reuses those
     // invariants for every subsequent task reservation.
     {
-      gridpack::utility::ScopedTimer invariantTimer(timer, t_ca_gpu_invariants);
+      gridpack::utility::ScopedTimer preparationTimer(
+          timer, t_batch_preparation);
+      gridpack::utility::ScopedTimer powerflowTimer(timer, t_pf_total);
       try {
         const std::vector<int> noTasks;
         batchAsm.reset(new gridpack::powerflow::GridpackBatchAssembler(
@@ -2434,11 +2438,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     bool noMoreTasks = false;
     while (batchWaveSize <= 0 ||
            static_cast<int>(myTasks.size()) < batchWaveSize) {
-      bool haveTask = false;
-      {
-        gridpack::utility::ScopedTimer dispatchTimer(timer, t_ca_task_dispatch);
-        haveTask = taskmgr.nextTask(task_comm, &task_id);
-      }
+      bool haveTask = taskmgr.nextTask(task_comm, &task_id);
       if (haveTask) {
         myTasks.push_back(task_id);
       } else {
@@ -2464,7 +2464,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     if (batchRankHealthy) {
       try {
         gridpack::utility::ScopedTimer wavePrepareTimer(
-            timer, t_ca_gpu_wave_prepare);
+            timer, t_batch_preparation);
         batchAsm->beginWave(myTasks);
         double _bt1 = _bprof ? MPI_Wtime() : 0.0;
         batchAsm->prepare();
@@ -2487,7 +2487,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
           static_cast<int>(batchAsm->nonBatchTaskIds().size());
         if (Wbatch > 0) {
           gridpack::utility::ScopedTimer batchNewtonTimer(
-              timer, t_ca_gpu_batch_newton);
+              timer, t_pf_total);
           gridpack::powerflow::PFBatchNR nr(
               *batchAsm, batchTol, batchMaxIter, batchRefactorEvery,
               batchConstantFactor, batchChordCap, batchDamping);
@@ -2537,7 +2537,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
         // refresh after the controller state is restored.
         if (Wbatch > 0 && (check_Qlim || pf_switchedShunt || pf_ltc)) {
           gridpack::utility::ScopedTimer controllerTimer(
-              timer, t_ca_gpu_controllers);
+              timer, t_pf_total);
           for (int k = 0; k < Wbatch; k++) {
             int tid = batchAsm->batchTaskId(k);
             if (batchIndexByTask.find(tid) == batchIndexByTask.end()) continue;
@@ -2650,7 +2650,7 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     for (size_t ti = 0; ti < retainedTasks.size(); ti++)
       runOneCase(retainedTasks[ti]);
     if (batchAsm) {
-      gridpack::utility::ScopedTimer restoreTimer(timer, t_ca_gpu_restore);
+      gridpack::utility::ScopedTimer restoreTimer(timer, t_pf_total);
       try {
         batchAsm->restoreBaseState();
       } catch (const std::exception& e) {
@@ -2702,21 +2702,16 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
 #endif
   {
     for (;;) {
-      bool haveTask = false;
-      {
-        gridpack::utility::ScopedTimer dispatchTimer(timer, t_ca_task_dispatch);
-        haveTask = taskmgr.nextTask(task_comm, &task_id);
-      }
+      bool haveTask = taskmgr.nextTask(task_comm, &task_id);
       if (!haveTask) break;
       runOneCase(task_id);
     }
   }
   if (_tsp && world.rank()==0) fprintf(stderr,"[TS] contingencyDone %.2fs\n", MPI_Wtime()-_ts0);
-  timer->stop(t_ca_processing);
-  timer->start(t_ca_finalization);
-
-  gridpack::utility::ScopedTimer flatFinalizeTimer(
-      timer, t_ca_flat_finalize);
+  gridpack::utility::ScopedTimer flatFinalizeTotalTimer(
+      timer, t_contingency_total);
+  gridpack::utility::ScopedTimer flatFinalizeWriteTimer(
+      timer, t_contingency_write);
   // csv_flat / csv_delta: each rank streamed rows to its .part file during
   // the loop. Close, sync, then world rank 0 writes header + concatenates.
   if (outputFormat == "csv_flat") {
@@ -2870,7 +2865,8 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
              totalSkip);
     }
   }
-  flatFinalizeTimer.stop();
+  flatFinalizeWriteTimer.stop();
+  flatFinalizeTotalTimer.stop();
 
   // Print statistics from task manager describing the number of tasks performed
   // per processor
@@ -2882,6 +2878,14 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
   // Export CA results to JSON or CSV.
   // Only rank 0 writes output files. Non-zero ranks send their serialized
   // data to rank 0 using point-to-point MPI send/recv.
+  boost::scoped_ptr<gridpack::utility::ScopedTimer> resultExportTotalTimer;
+  boost::scoped_ptr<gridpack::utility::ScopedTimer> resultExportWriteTimer;
+  if (outputFormat == "json" || outputFormat == "csv") {
+    resultExportTotalTimer.reset(new gridpack::utility::ScopedTimer(
+        timer, t_contingency_total));
+    resultExportWriteTimer.reset(new gridpack::utility::ScopedTimer(
+        timer, t_contingency_write));
+  }
   if (outputFormat == "json") {
     // Each process serializes its contingency results as JSON text
     std::ostringstream localJsonStream;
@@ -3051,11 +3055,15 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
       }
     }
   }
+  resultExportWriteTimer.reset();
+  resultExportTotalTimer.reset();
 
   // Universal convergence sidecar: gather, sort by event_idx, write.
   if (emitConv) {
-    gridpack::utility::ScopedTimer convergenceTimer(
-        timer, t_ca_convergence_output);
+    gridpack::utility::ScopedTimer convergenceTotalTimer(
+        timer, t_contingency_total);
+    gridpack::utility::ScopedTimer convergenceWriteTimer(
+        timer, t_contingency_write);
     auto formatRow = [](std::ostringstream &os, const ConvRow &r) {
       os << r.event_idx << ","
          << r.name << ","
@@ -3160,11 +3168,9 @@ void gridpack::contingency_analysis::CADriver::execute(int argc, char** argv)
     perf_stats->sumColumnValues("perf_sum.txt",1);
     timer->stop(t_stats);
   }
-  timer->stop(t_ca_finalization);
   timer->stop(t_total);
   if (world.rank() == 0) {
-    printf("[profiling] schema=ca-v2 common_phases=6 "
-           "legacy_categories=preserved\n");
+    printf("[profiling] schema=legacy-v1 gpu_legacy_mapping=1\n");
   }
   if (_tsp && world.rank()==0) fprintf(stderr,"[TS] end %.2fs\n", MPI_Wtime()-_ts0);
   // If all processors executed at least one task, then print out timing

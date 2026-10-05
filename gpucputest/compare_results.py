@@ -107,15 +107,43 @@ TOTAL_CONTINGENCIES_RE = re.compile(r"Total contingencies to analyze:\s*(\d+)")
 GPU_SUMMARY_RE = re.compile(r"\[GPU all-rank summary\]\s*(.*)")
 KEY_VALUE_RE = re.compile(r"([A-Za-z_]+)=([0-9]+)")
 PROFILE_SCHEMA_RE = re.compile(r"\[profiling\]\s+schema=([A-Za-z0-9_.-]+)")
-
-CA_V2_COMMON_PHASES = (
-    "CA: Configuration",
-    "CA: Model and Output Setup",
-    "CA: Base Case",
-    "CA: Contingency Setup",
-    "CA: Contingency Processing",
-    "CA: Result Finalization",
+PROFILE_LEGACY_MAPPING_RE = re.compile(
+    r"\bgpu_legacy_mapping=([01])\b"
 )
+
+# These names comprise the timing contract printed by the supplied stock
+# GridPACK profile. Keep the list explicit: sharing a prefix does not make a new
+# timer comparable.
+GRIDPACK_LEGACY_TIMERS = frozenset(
+    {
+        "Powerflow: Total Application",
+        "Powerflow: Network Parser",
+        "Powerflow: Partition",
+        "Powerflow: Factory Load",
+        "Powerflow: Factory Set Components",
+        "Powerflow: Factory Set Exchange",
+        "Powerflow: Bus Update",
+        "Powerflow: Factory Operations",
+        "Powerflow: Create Mappers",
+        "Powerflow: Map to Matrix",
+        "Powerflow: Map to Vector",
+        "Vector Map: New Vector",
+        "Vector Map: Load Bus Data",
+        "loadBusData: Add Vector Elements",
+        "loadBusData: Fill Buffer",
+        "loadBusData: Add Elements",
+        "Vector Map: Set Vector",
+        "Powerflow: Create Linear Solver",
+        "Powerflow: Solve Linear Equation",
+        "Powerflow: Map to Bus",
+        "mapToBus: get Data",
+        "mapToBus: set Data",
+        "Contingency: Total Application",
+        "Contingency: Write Results",
+    }
+)
+
+NEW_DIAGNOSTIC_TIMERS = frozenset({"Contingency: Batch Preparation"})
 
 
 def scalar(value: Any) -> Any:
@@ -807,6 +835,7 @@ def parse_log(path: Path) -> dict[str, Any]:
     total_contingencies = None
     gpu_summary: dict[str, int] = {}
     profiling_schema = None
+    gpu_legacy_mapping = False
     current_timer: str | None = None
 
     with path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -844,6 +873,9 @@ def parse_log(path: Path) -> dict[str, Any]:
             schema = PROFILE_SCHEMA_RE.search(line)
             if schema:
                 profiling_schema = schema.group(1)
+            legacy_mapping = PROFILE_LEGACY_MAPPING_RE.search(line)
+            if legacy_mapping:
+                gpu_legacy_mapping = legacy_mapping.group(1) == "1"
 
     task_values = list(tasks.values())
     task_stats: dict[str, Any] = {"by_rank": tasks}
@@ -873,62 +905,16 @@ def parse_log(path: Path) -> dict[str, Any]:
         "tasks": task_stats,
         "gpu_summary": gpu_summary,
         "profiling_schema": profiling_schema,
-    }
-
-
-def profile_phase_coverage(parsed_log: dict[str, Any]) -> dict[str, Any]:
-    """Account for the ca-v2 whole-run timer using its six disjoint phases."""
-    timers = parsed_log["timers"]
-    missing = [
-        name
-        for name in CA_V2_COMMON_PHASES
-        if timers.get(name, {}).get("average") is None
-    ]
-    total = timers.get("Total Application", {}).get("average")
-    phase_sum = (
-        sum(timers[name]["average"] for name in CA_V2_COMMON_PHASES)
-        if not missing
-        else None
-    )
-    residual = (
-        total - phase_sum
-        if total is not None and phase_sum is not None
-        else None
-    )
-    # CoarseTimer prints four decimal places. The total and each of the six
-    # phases may independently round by half a unit in the last printed place.
-    rounding_tolerance = 0.00005 * (len(CA_V2_COMMON_PHASES) + 1)
-    return {
-        "schema": parsed_log["profiling_schema"],
-        "complete": (
-            parsed_log["profiling_schema"] == "ca-v2"
-            and total is not None
-            and not missing
-        ),
-        "missing_common_phases": missing,
-        "total_average_seconds": total,
-        "common_phase_average_sum_seconds": phase_sum,
-        "unaccounted_average_seconds": residual,
-        "accounted_percent": (
-            percent(phase_sum, total)
-            if phase_sum is not None and total is not None
-            else None
-        ),
-        "printed_time_rounding_tolerance_seconds": rounding_tolerance,
-        "residual_within_printed_time_rounding": (
-            abs(residual) <= rounding_tolerance
-            if residual is not None
-            else None
-        ),
+        "gpu_legacy_mapping": gpu_legacy_mapping,
     }
 
 
 def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
     gpu = parse_log(gpu_log)
     cpu = parse_log(cpu_log)
-    matching_ca_v2 = (
-        gpu["profiling_schema"] == "ca-v2"
-        and cpu["profiling_schema"] == "ca-v2"
+    legacy_mapping_enabled = (
+        gpu["profiling_schema"] == "legacy-v1"
+        and gpu["gpu_legacy_mapping"]
     )
     timer_names = sorted(
         set(gpu["timers"]) | set(cpu["timers"]),
@@ -942,16 +928,23 @@ def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
             comparison_scope = "cross-version total"
             comparable = True
             comparison_note = (
-                "Same CADriver::execute boundary in stock and ca-v2 profiles"
+                "Same CADriver::execute boundary in stock and profiled runs"
             )
-        elif name in CA_V2_COMMON_PHASES:
-            comparison_scope = "ca-v2 common phase"
-            comparable = matching_ca_v2
+        elif name in GRIDPACK_LEGACY_TIMERS:
+            comparison_scope = "GridPACK legacy category"
+            comparable = legacy_mapping_enabled
             comparison_note = (
-                "Identical non-overlapping ca-v2 phase boundary"
+                "Same named GridPACK scope with equivalent optimized work"
                 if comparable
-                else "Requires ca-v2 profiling schema in both logs"
+                else (
+                    "Requires GPU schema=legacy-v1 and "
+                    "gpu_legacy_mapping=1 profile marker"
+                )
             )
+        elif name in NEW_DIAGNOSTIC_TIMERS:
+            comparison_scope = "new diagnostic"
+            comparable = False
+            comparison_note = "New optimized-path work with no stock timer"
         elif name.startswith("CA GPU:"):
             comparison_scope = "GPU diagnostic"
             comparable = False
@@ -963,11 +956,10 @@ def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
                 "Useful within one implementation; workload may differ by path"
             )
         else:
-            comparison_scope = "legacy diagnostic"
+            comparison_scope = "unclassified diagnostic"
             comparable = False
             comparison_note = (
-                "Legacy category is retained for compatibility but does not have "
-                "a path-independent scope"
+                "No explicitly defined stock GridPACK comparison scope"
             )
         row: dict[str, Any] = {
             "timer": name,
@@ -995,15 +987,29 @@ def compare_performance(gpu_log: Path, cpu_log: Path) -> dict[str, Any]:
                 else None
             )
         timers.append(row)
+    shared_legacy_categories = sorted(
+        GRIDPACK_LEGACY_TIMERS
+        & set(gpu["timers"])
+        & set(cpu["timers"])
+    )
     return {
         "gpu": gpu,
         "cpu": cpu,
         "profiling_compatibility": {
             "gpu_schema": gpu["profiling_schema"],
             "cpu_schema": cpu["profiling_schema"],
-            "common_phase_comparison_enabled": matching_ca_v2,
-            "gpu_phase_coverage": profile_phase_coverage(gpu),
-            "cpu_phase_coverage": profile_phase_coverage(cpu),
+            "legacy_category_comparison_enabled": legacy_mapping_enabled,
+            "shared_legacy_categories": shared_legacy_categories,
+            "gpu_only_legacy_categories": sorted(
+                GRIDPACK_LEGACY_TIMERS
+                & set(gpu["timers"])
+                - set(cpu["timers"])
+            ),
+            "cpu_only_legacy_categories": sorted(
+                GRIDPACK_LEGACY_TIMERS
+                & set(cpu["timers"])
+                - set(gpu["timers"])
+            ),
         },
         "timer_comparison": timers,
     }
@@ -1062,8 +1068,6 @@ def build_markdown(report: dict[str, Any]) -> str:
     convergence = report["convergence"]
     performance = report["performance"]
     compatibility = performance["profiling_compatibility"]
-    gpu_phase_coverage = compatibility["gpu_phase_coverage"]
-    cpu_phase_coverage = compatibility["cpu_phase_coverage"]
     total_timer = next(
         (
             row
@@ -1214,19 +1218,17 @@ def build_markdown(report: dict[str, Any]) -> str:
             ),
             "",
             (
-                "Common phase comparisons: "
+                "GridPACK legacy category comparisons: "
                 + (
-                    "enabled (`ca-v2` is present in both logs)."
-                    if compatibility["common_phase_comparison_enabled"]
-                    else "disabled (both logs must declare `ca-v2`)."
+                    "enabled"
+                    if compatibility["legacy_category_comparison_enabled"]
+                    else "disabled"
                 )
-            ),
-            (
-                "Six-phase average-time coverage: "
-                f"GPU {display_number(gpu_phase_coverage['accounted_percent'])}%; "
-                f"CPU {display_number(cpu_phase_coverage['accounted_percent'])}%. "
-                "Small residuals can be caused by the timer's four-decimal output "
-                "rounding."
+                + " (`schema=legacy-v1 gpu_legacy_mapping=1` is required in "
+                "the GPU log). "
+                f"Both logs contain "
+                f"{len(compatibility['shared_legacy_categories'])} of "
+                f"{len(GRIDPACK_LEGACY_TIMERS)} legacy categories."
             ),
             "",
             "See `comparison_report.json`, `numerical_differences.csv`, and "
